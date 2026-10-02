@@ -1500,8 +1500,8 @@ const DEVCONTAINER_CONFIG_PATH: &str = "/opt/rumpelpod/devcontainer.json";
 /// CLI flags and `${containerEnv:...}` from the process environment,
 /// probes the user's shell, and merges everything into a single env map.
 fn resolve_pod_env(
-    _repo_path: &Path,
-    _pod_name: &str,
+    repo_path: &Path,
+    pod_name: &str,
     local_env_args: &[String],
 ) -> (
     HashMap<String, String>,
@@ -1534,6 +1534,10 @@ fn resolve_pod_env(
         }
     };
 
+    // The baked file contains the host configuration before pod-specific
+    // paths are known. Resolve those variables here so lifecycle commands
+    // receive the same container workspace values as the launch path.
+    let dc = crate::devcontainer::resolve_devcontainer_vars(dc, repo_path, pod_name, &local_env);
     let lifecycle_config = dc.lifecycle.clone();
 
     // Resolve local host and container environment references in remoteEnv values,

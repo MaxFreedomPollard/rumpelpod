@@ -48,6 +48,48 @@ fn write_devcontainer_with_lifecycle(repo: &TestRepo, lifecycle_json: &str) {
     .expect("Failed to write devcontainer.json");
 }
 
+/// Lifecycle command arrays must expand the container workspace path before
+/// they are executed inside the prepared pod.
+#[test]
+fn lifecycle_commands_expand_container_workspace_folder() {
+    let repo = TestRepo::new();
+
+    write_devcontainer_with_lifecycle(
+        &repo,
+        r#""onCreateCommand": {
+                "check": ["sh", "${containerWorkspaceFolder}/.devcontainer/check.sh"]
+            }"#,
+    );
+    fs::write(
+        repo.path().join(".devcontainer/check.sh"),
+        "printf expanded > /tmp/container_workspace_folder_expanded\n",
+    )
+    .expect("Failed to write lifecycle check script");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let stdout = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "lc-container-workspace",
+            "--",
+            "cat",
+            "/tmp/container_workspace_folder_expanded",
+        ])
+        .success()
+        .expect("rumpel enter failed");
+
+    assert_eq!(
+        String::from_utf8_lossy(&stdout).trim(),
+        "expanded",
+        "containerWorkspaceFolder must resolve before lifecycle execution"
+    );
+}
+
 /// onCreateCommand should run only on first container creation — not on
 /// subsequent enters that reuse the same container.
 #[test]
