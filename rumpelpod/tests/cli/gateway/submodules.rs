@@ -662,6 +662,7 @@ fn uninitialized_submodule_keeps_parent_remotes_after_restart() {
         set -eu
         printf '[submodule "vendor"]\n\tpath = vendor\n\turl = https://example.invalid/vendor.git\n' > .gitmodules
         mkdir vendor
+        git update-index --add --cacheinfo "160000,$(git rev-parse HEAD),vendor"
     "#};
     pod_command(&repo, &daemon)
         .args(["enter", "--create", pod_name, "--", "sh", "-c", add_entry])
@@ -701,4 +702,138 @@ fn uninitialized_submodule_keeps_parent_remotes_after_restart() {
         .args(["enter", "--create", pod_name, "--", "sh", "-c", push_script])
         .success()
         .expect("git push rumpelpod should work after daemon restart");
+}
+
+#[test]
+fn stale_gitmodules_entry_does_not_break_setup() {
+    let (parent, _child, sub_name) = create_test_repo_with_submodule();
+
+    // Removing a submodule from the tree can leave its .gitmodules
+    // section behind.  Git ignores such an entry, but `git submodule
+    // init <path>` fails on it, which used to abort the pod setup.
+    let gitmodules_path = parent.path().join(".gitmodules");
+    let mut gitmodules = fs::read_to_string(&gitmodules_path).unwrap();
+    gitmodules.push_str(indoc! {r#"
+        [submodule "removed"]
+            path = removed
+            url = https://example.invalid/removed.git
+        [submodule "replaced"]
+            path = replaced
+            url = https://example.invalid/replaced.git
+    "#});
+    fs::write(&gitmodules_path, gitmodules).unwrap();
+    // A tracked path still needs a gitlink, not just any index entry.
+    fs::write(parent.path().join("replaced"), "ordinary file\n").unwrap();
+    Command::new("git")
+        .args(["add", ".gitmodules", "replaced"])
+        .current_dir(parent.path())
+        .success()
+        .expect("staging stale submodule entries failed");
+    Command::new("git")
+        .args(["commit", "-m", "Leave stale .gitmodules entries"])
+        .current_dir(parent.path())
+        .success()
+        .expect("git commit (stale .gitmodules entry) failed");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&parent, "", "");
+    fs::write(parent.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let pod_name = "stale-gitmodules";
+
+    // The real submodule next to the stale entry must still be cloned.
+    // Without a clone, git would resolve HEAD to the parent repo.
+    let pod_sub_commit = pod_command(&parent, &daemon)
+        .args([
+            "enter",
+            "--create",
+            pod_name,
+            "--",
+            "git",
+            "-C",
+            &sub_name,
+            "rev-parse",
+            "HEAD",
+        ])
+        .success()
+        .expect("rumpel enter failed with a stale .gitmodules entry");
+    let pod_sub_commit = String::from_utf8_lossy(&pod_sub_commit).trim().to_string();
+
+    let child_commit = Command::new("git")
+        .args(["rev-parse", &format!("HEAD:{sub_name}")])
+        .current_dir(parent.path())
+        .success()
+        .expect("reading the parent's recorded submodule commit failed");
+    let child_commit = String::from_utf8_lossy(&child_commit).trim().to_string();
+
+    assert_eq!(
+        pod_sub_commit, child_commit,
+        "Pod should check out the submodule at the commit recorded by the parent"
+    );
+}
+
+#[test]
+fn nested_stale_gitmodules_entry_does_not_break_setup() {
+    let (parent, _child, _grandchild, child_name, grandchild_name) =
+        create_test_repo_with_nested_submodules();
+    let child_path = parent.path().join(&child_name);
+    let gitmodules_path = child_path.join(".gitmodules");
+    let mut gitmodules = fs::read_to_string(&gitmodules_path).unwrap();
+    gitmodules.push_str(indoc! {r#"
+        [submodule "removed"]
+            path = removed
+            url = https://example.invalid/removed.git
+    "#});
+    fs::write(&gitmodules_path, gitmodules).unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Leave a nested stale entry", ".gitmodules"])
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .current_dir(&child_path)
+        .success()
+        .expect("committing the nested stale entry failed");
+    Command::new("git")
+        .args(["commit", "-m", "Record the stale nested entry", &child_name])
+        .current_dir(parent.path())
+        .success()
+        .expect("recording the child commit failed");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&parent, "", "");
+    fs::write(parent.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    // Filtering only the top-level .gitmodules would still abort while
+    // cloning this child, before its valid nested submodule is usable.
+    let pod_commit = pod_command(&parent, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "nested-stale-gitmodules",
+            "--",
+            "git",
+            "-C",
+            &grandchild_name,
+            "rev-parse",
+            "HEAD",
+        ])
+        .success()
+        .expect("rumpel enter failed with a nested stale entry");
+    let nested_path = grandchild_name
+        .strip_prefix(&format!("{child_name}/"))
+        .unwrap();
+    let recorded_commit = Command::new("git")
+        .args(["rev-parse", &format!("HEAD:{nested_path}")])
+        .current_dir(&child_path)
+        .success()
+        .expect("reading the recorded nested submodule commit failed");
+    assert_eq!(
+        String::from_utf8_lossy(&pod_commit).trim(),
+        String::from_utf8_lossy(&recorded_commit).trim(),
+        "the valid nested submodule must still be checked out"
+    );
 }
