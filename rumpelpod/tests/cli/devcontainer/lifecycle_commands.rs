@@ -7,9 +7,10 @@
 //! the Dev Container spec: ordering, frequency, command formats, failure
 //! propagation, and the `waitFor` setting.
 
-use indoc::formatdoc;
+use indoc::{formatdoc, indoc};
 use rumpelpod::CommandExt;
 use std::fs;
+use std::process::Command;
 
 use crate::common::{pod_command, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH, TEST_USER};
 use crate::executor::ExecutorResources;
@@ -46,6 +47,148 @@ fn write_devcontainer_with_lifecycle(repo: &TestRepo, lifecycle_json: &str) {
         devcontainer_json,
     )
     .expect("Failed to write devcontainer.json");
+}
+
+#[test]
+fn lifecycle_commands_expand_container_workspace_folder() {
+    let repo = TestRepo::new();
+
+    write_devcontainer_with_lifecycle(
+        &repo,
+        indoc! {r#"
+            "onCreateCommand": {
+                "check": ["sh", "${containerWorkspaceFolder}/.devcontainer/check.sh", "on-create", "${containerWorkspaceFolderBasename}"]
+            },
+            "updateContentCommand": ["sh", "${containerWorkspaceFolder}/.devcontainer/check.sh", "update-content", "${containerWorkspaceFolderBasename}"],
+            "postCreateCommand": "sh '${containerWorkspaceFolder}/.devcontainer/check.sh' post-create '${containerWorkspaceFolderBasename}'",
+            "postStartCommand": {
+                "check": "sh '${containerWorkspaceFolder}/.devcontainer/check.sh' post-start '${containerWorkspaceFolderBasename}'"
+            },
+            "waitFor": "postStartCommand"
+        "#},
+    );
+    fs::write(
+        repo.path().join(".devcontainer/check.sh"),
+        "printf '%s:%s\\n' \"$1\" \"$2\" >> /tmp/container_workspace_folder_expanded\n",
+    )
+    .expect("Failed to write lifecycle check script");
+    // Checkout preparation removes untracked files from the baked workspace.
+    Command::new("git")
+        .args(["add", ".devcontainer/check.sh"])
+        .current_dir(repo.path())
+        .success()
+        .expect("staging the lifecycle script failed");
+    Command::new("git")
+        .args(["commit", "-m", "Keep the lifecycle script in the checkout"])
+        .current_dir(repo.path())
+        .success()
+        .expect("committing the lifecycle script failed");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let stdout = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "lc-container-workspace",
+            "--",
+            "cat",
+            "/tmp/container_workspace_folder_expanded",
+        ])
+        .success()
+        .expect("rumpel enter failed");
+
+    assert_eq!(
+        String::from_utf8_lossy(&stdout).trim(),
+        indoc! {"
+            on-create:workspace
+            update-content:workspace
+            post-create:workspace
+            post-start:workspace
+        "}
+        .trim(),
+        "all lifecycle command forms must resolve the container workspace"
+    );
+}
+
+#[test]
+fn lifecycle_commands_expand_actual_container_workspace_folder() {
+    let repo = TestRepo::new();
+    write_devcontainer_with_lifecycle(
+        &repo,
+        indoc! {r#"
+            "onCreateCommand": [
+                "sh", "-c", "printf '%s\\n' \"$@\" > /tmp/lifecycle-workspace", "check",
+                "${containerWorkspaceFolder}", "${containerWorkspaceFolderBasename}"
+            ]
+        "#},
+    );
+    // The suffix distinguishes the host directory name from the container's.
+    let config_path = repo.path().join(".devcontainer/devcontainer.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["workspaceFolder"] =
+        serde_json::json!("/workspaces/${localWorkspaceFolderBasename}-pod");
+    fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let stdout = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "lc-actual-workspace",
+            "--",
+            "cat",
+            "/tmp/lifecycle-workspace",
+        ])
+        .success()
+        .expect("enter with a workspace derived from the host path failed");
+    let host_basename = repo.path().file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!("/workspaces/{host_basename}-pod\n{host_basename}-pod\n"),
+        "lifecycle commands must use the workspace that was actually created"
+    );
+}
+
+#[test]
+fn lifecycle_commands_preserve_literal_local_env_values() {
+    let repo = TestRepo::new();
+    write_devcontainer_with_lifecycle(
+        &repo,
+        indoc! {r#"
+            "remoteEnv": { "LITERAL_VALUE": "${localEnv:RUMPELPOD_LIFECYCLE_LITERAL}" },
+            "onCreateCommand": "printf '%s' \"$LITERAL_VALUE\" > /tmp/lifecycle-literal"
+        "#},
+    );
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let literal = "${localEnv:RUMPELPOD_LITERAL_UNSET:unexpected-expansion}";
+    let stdout = pod_command(&repo, &daemon)
+        .env("RUMPELPOD_LIFECYCLE_LITERAL", literal)
+        .args([
+            "enter",
+            "--create",
+            "lc-literal-env",
+            "--",
+            "cat",
+            "/tmp/lifecycle-literal",
+        ])
+        .success()
+        .expect("enter with a literal environment value failed");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        literal,
+        "forwarded environment values must not be expanded a second time"
+    );
 }
 
 /// onCreateCommand should run only on first container creation — not on

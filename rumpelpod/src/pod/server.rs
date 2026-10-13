@@ -27,6 +27,10 @@ use super::git_setup::{self, GitSetupRequest, GitSetupSubmodulesRequest};
 use super::types::*;
 use crate::async_runtime::block_on;
 use crate::command_ext::CommandExt;
+use crate::devcontainer::{
+    resolve_container_env_in_process, resolve_local_env_from_map, DevContainer,
+    SubstitutionContext, UserEnvProbe,
+};
 
 pub const TOKEN_FILE: &str = "/opt/rumpelpod/server-token";
 /// In-container path for the SSH agent socket served by the relay.
@@ -1500,17 +1504,13 @@ const DEVCONTAINER_CONFIG_PATH: &str = "/opt/rumpelpod/devcontainer.json";
 /// CLI flags and `${containerEnv:...}` from the process environment,
 /// probes the user's shell, and merges everything into a single env map.
 fn resolve_pod_env(
-    _repo_path: &Path,
+    repo_path: &Path,
     _pod_name: &str,
     local_env_args: &[String],
 ) -> (
     HashMap<String, String>,
     crate::devcontainer::LifecycleConfig,
 ) {
-    use crate::devcontainer::{
-        resolve_container_env_in_process, resolve_local_env_from_map, DevContainer, UserEnvProbe,
-    };
-
     // Parse --local-env KEY=VALUE args into a map.
     let local_env: HashMap<String, String> = local_env_args
         .iter()
@@ -1534,6 +1534,21 @@ fn resolve_pod_env(
         }
     };
 
+    // The server receives the resolved container path. Re-evaluating
+    // workspaceFolder here would mistake it for the host workspace.
+    let dc = dc.substitute(&SubstitutionContext {
+        local_env: None,
+        local_workspace_folder: None,
+        local_workspace_folder_basename: None,
+        container_workspace_folder: Some(repo_path.to_string_lossy().to_string()),
+        container_workspace_folder_basename: Some(
+            repo_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "workspace".to_string()),
+        ),
+        devcontainer_id: None,
+    });
     let lifecycle_config = dc.lifecycle.clone();
 
     // Resolve local host and container environment references in remoteEnv values,
