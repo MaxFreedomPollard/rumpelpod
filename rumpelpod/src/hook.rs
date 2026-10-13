@@ -81,16 +81,14 @@ fn read_ref_updates() -> Result<Vec<(String, String, String)>> {
     Ok(updates)
 }
 
-/// Run a git command, logging failures to stderr.
+// Host disconnects are routine; automatic sync must not interrupt local work.
 fn run_git(args: &[&str], skip_lfs_pre_push: bool) {
     let mut command = Command::new("git");
     command.args(args);
     if skip_lfs_pre_push {
         command.env("GIT_LFS_SKIP_PUSH", "1");
     }
-    if let Err(e) = command.success() {
-        eprintln!("rumpelpod hook: {e:#}");
-    }
+    let _ = command.output();
 }
 
 // -- Pod repo hooks ----------------------------------------------------------
@@ -118,10 +116,7 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
         let skip_lfs_pre_push = if newvalue != ZERO_OID && oldvalue == ZERO_OID {
             match crate::git::prepare_lfs_for_new_ref(Path::new("."), "rumpelpod", &newvalue) {
                 Ok(skip) => skip,
-                Err(e) => {
-                    eprintln!("rumpelpod hook: git lfs push failed: {e:#}");
-                    continue;
-                }
+                Err(_) => continue,
             }
         } else {
             false

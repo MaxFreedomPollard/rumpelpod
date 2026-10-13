@@ -460,7 +460,7 @@ If `kubernetes.builder` is set, Docker buildx is required.
 { "sshAgent": { "keys": ["~/.ssh/id_ed25519"] } }
 ```
 
-Controls the SSH agent relayed into the pod.
+Controls the SSH agent relayed into the pod and image builds.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|

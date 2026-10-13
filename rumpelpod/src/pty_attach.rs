@@ -60,6 +60,19 @@ pub enum AttachOutcome {
     SessionEnded,
 }
 
+/// The terminal bridge has not started, so a caller using cached
+/// connection details can prepare the pod and retry.
+#[derive(Debug)]
+pub struct InitialConnectionFailed(anyhow::Error);
+
+impl std::fmt::Display for InitialConnectionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "initial PTY connection failed: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for InitialConnectionFailed {}
+
 /// The daemon has no live local session and cannot construct one from its
 /// current cached pod connection. Callers may perform targeted preparation
 /// and retry the same endpoint.
@@ -379,12 +392,17 @@ async fn connect_ws(
     params: &WireParams,
     create: bool,
 ) -> Result<WsStream> {
-    let stream = open_transport(transport).await?;
-    let request = build_ws_request(transport, path, token)?;
-
-    let (mut ws, _response) = tokio_tungstenite::client_async(request, stream)
-        .await
-        .context("WebSocket handshake failed")?;
+    // A cached proxy can still be listening after its remote transport
+    // fails. Bound the handshake so callers can reach pod recovery.
+    let (mut ws, _response) = tokio::time::timeout(Duration::from_secs(10), async {
+        let stream = open_transport(transport).await?;
+        let request = build_ws_request(transport, path, token)?;
+        tokio_tungstenite::client_async(request, stream)
+            .await
+            .context("WebSocket handshake failed")
+    })
+    .await
+    .context("timed out connecting to PTY session")??;
 
     let (cols, rows) = get_terminal_size().unwrap_or((80, 24));
     let first_msg = match params {
@@ -430,7 +448,9 @@ async fn attach_async(
     reconnect: Option<ReconnectConfig>,
 ) -> Result<AttachOutcome> {
     // First connection: propagate errors (invalid URL, unreachable pod).
-    let ws = connect_ws(transport, path, token, &params, true).await?;
+    let ws = connect_ws(transport, path, token, &params, true)
+        .await
+        .map_err(InitialConnectionFailed)?;
 
     // Defer raw mode until the remote sends its first output, so ctrl-c
     // works while waiting for the session to start.

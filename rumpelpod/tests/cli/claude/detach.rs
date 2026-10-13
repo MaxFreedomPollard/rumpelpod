@@ -5,6 +5,8 @@
 //! survives across client disconnections and the screen is replayed.
 //! Also tests that the client exits cleanly when the remote session ends.
 
+use std::time::Instant;
+
 use super::common::{setup_claude_test_repo, ClaudeSession};
 
 /// Ctrl-a (0x01) followed by 'd' triggers detach.
@@ -20,6 +22,9 @@ fn claude_detach_reattach() {
         ClaudeSession::spawn(&repo, &daemon, fake_home.path(), "claude-haiku-4-5", &[]);
 
     session.wait_for("~/workspace");
+    let replay_marker = "claude-reattach-keeps-pending-input";
+    session.write_raw(replay_marker.as_bytes());
+    session.wait_for(replay_marker);
 
     // Send the detach sequence: Ctrl-a then d.
     session.write_raw(&[CTRL_A, b'd']);
@@ -27,17 +32,34 @@ fn claude_detach_reattach() {
     // The rumpel process should exit after detaching.
     session.wait_for_exit();
 
+    // Preparation would parse this file. A running session must remain
+    // reachable while the host's next devcontainer config is being edited.
+    std::fs::write(
+        repo.path().join(".devcontainer/devcontainer.json"),
+        "invalid json",
+    )
+    .expect("invalidate host devcontainer config");
+
     // -- Second session: reattach and verify screen replay -------------
     //
     // The server maintains a virtual terminal buffer (like screen/tmux)
     // and replays the screen contents on attach, so the client sees the
     // full TUI immediately without the app needing to re-render.
 
-    let mut session2 =
-        ClaudeSession::spawn(&repo, &daemon, fake_home.path(), "claude-haiku-4-5", &[]);
+    let started = Instant::now();
+    let mut session2 = ClaudeSession::spawn_for_pod(
+        &repo,
+        &daemon,
+        fake_home.path(),
+        "test",
+        false,
+        "claude-haiku-4-5",
+        &[],
+    );
 
-    // The screen replay should restore the prompt without any user input.
-    session2.wait_for("~/workspace");
+    session2.wait_for(replay_marker);
+    let elapsed = started.elapsed();
+    eprintln!("Claude warm reattach screen replay: {elapsed:?}");
 }
 
 /// After Ctrl-a d the terminal must be fully restored: mouse tracking
@@ -114,6 +136,14 @@ fn claude_session_exit() {
     // The rumpel process must exit, not hang.  wait_for_exit panics
     // after 10s if the child is still alive.
     session.wait_for_exit();
+
+    // A replacement session must use the running pod's original workspace,
+    // without needing the host devcontainer configuration again.
+    std::fs::write(
+        repo.path().join(".devcontainer/devcontainer.json"),
+        "invalid json",
+    )
+    .expect("invalidate host devcontainer config");
 
     // Restarting must launch a fresh Claude session rather than
     // reattaching to the now-dead one.

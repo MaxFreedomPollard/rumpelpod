@@ -38,6 +38,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         pkg-config \
         git \
         git-lfs \
+        ripgrep \
         curl \
         wget \
         ca-certificates \

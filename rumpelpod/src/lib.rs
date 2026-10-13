@@ -50,6 +50,7 @@ pub mod review;
 mod service;
 mod slow_guard;
 mod ssh;
+mod ssh_agent;
 mod stop;
 mod switch_user;
 mod tcp_proxy;

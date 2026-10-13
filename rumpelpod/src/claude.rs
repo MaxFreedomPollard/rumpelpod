@@ -11,7 +11,8 @@ use crate::cli::ClaudeCommand;
 use crate::config::load_json_config;
 use crate::daemon;
 use crate::daemon::protocol::{
-    ContainerId, Daemon, DaemonClient, EnsureClaudeConfigRequest, PodName,
+    ClaudeConnection, ClientContext, ConnectPodRequest, ContainerId, Daemon, DaemonClient,
+    EnsureClaudeConfigRequest, PodName,
 };
 use crate::enter::{confirm_pod_creation, launch_pod};
 use crate::git::get_repo_root;
@@ -29,8 +30,6 @@ pub fn claude(cmd: &ClaudeCommand) -> Result<()> {
     let elapsed = t.elapsed();
     trace!("get_repo_root: {elapsed:?}");
 
-    let host_override = cmd.container_config.resolve_host()?;
-
     let json_config = load_json_config(&repo_root)?;
 
     // CLI --no-dangerously-skip-permissions wins over the config setting.
@@ -43,6 +42,34 @@ pub fn claude(cmd: &ClaudeCommand) -> Result<()> {
         && (cmd.dangerously_skip_permissions_hook
             || json_config.claude.dangerously_skip_permissions_hook);
 
+    let socket_path = daemon::socket_path()?;
+    let client = DaemonClient::new_unix(&socket_path);
+    if let Some(connection) = client.claude_connection(ConnectPodRequest {
+        pod_name: cmd.name.clone(),
+        repo_path: repo_root.clone(),
+        client_context: ClientContext::current(),
+    })? {
+        trace!("attaching Claude through cached pod connection");
+        match attach_claude(
+            cmd,
+            &repo_root,
+            &connection,
+            skip_permissions,
+            permission_hook,
+        ) {
+            Ok(outcome) => return finish_attachment(outcome),
+            Err(error)
+                if error
+                    .downcast_ref::<pty_attach::InitialConnectionFailed>()
+                    .is_some() =>
+            {
+                trace!("cached Claude connection failed, preparing pod: {error:#}");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let host_override = cmd.container_config.resolve_host()?;
     confirm_pod_creation(&cmd.name, &repo_root, cmd.create)?;
 
     let t = Instant::now();
@@ -59,8 +86,6 @@ pub fn claude(cmd: &ClaudeCommand) -> Result<()> {
     let t = Instant::now();
     let config_result = {
         let tc = Instant::now();
-        let socket_path = daemon::socket_path()?;
-        let client = DaemonClient::new_unix(&socket_path);
         let pod_name = PodName::new(cmd.name.clone()).map_err(|e| anyhow::anyhow!(e))?;
         let cfg_result = client.ensure_claude_config(EnsureClaudeConfigRequest {
             pod_name,
@@ -82,38 +107,65 @@ pub fn claude(cmd: &ClaudeCommand) -> Result<()> {
 
     config_result?;
 
+    let elapsed = t_total.elapsed();
+    trace!("total claude startup: {elapsed:?}");
+
+    let connection = ClaudeConnection {
+        container_url: result.container_url,
+        container_token: result.container_token,
+        container_repo_path: workdir,
+    };
+    let outcome = attach_claude(
+        cmd,
+        &repo_root,
+        &connection,
+        skip_permissions,
+        permission_hook,
+    )?;
+    finish_attachment(outcome)
+}
+
+fn attach_claude(
+    cmd: &ClaudeCommand,
+    repo_root: &Path,
+    connection: &ClaudeConnection,
+    skip_permissions: bool,
+    permission_hook: bool,
+) -> Result<pty_attach::AttachOutcome> {
     let mut claude_cmd = vec![crate::daemon::CLAUDE_CONTAINER_BIN.to_string()];
     if skip_permissions && !permission_hook {
         claude_cmd.push("--dangerously-skip-permissions".to_string());
     }
     claude_cmd.extend(cmd.args.clone());
 
-    let workdir_str = workdir.to_string_lossy().to_string();
-
-    let elapsed = t_total.elapsed();
-    trace!("total claude startup: {elapsed:?}");
-
     let reconnect = Some(pty_attach::ReconnectConfig {
         daemon_socket: daemon::socket_path()?,
-        repo_path: repo_root.clone(),
+        repo_path: repo_root.to_path_buf(),
         pod_name: cmd.name.clone(),
     });
 
-    let outcome = pty_attach::attach(
+    pty_attach::attach(
         pty_attach::PtyTransport::Tcp {
-            url: result.container_url.clone(),
+            url: connection.container_url.clone(),
         },
         "/claude",
-        &result.container_token,
+        &connection.container_token,
         pty_attach::WireParams::Session(pty_attach::SessionParams {
             name: PTY_SESSION_NAME.to_string(),
             cmd: claude_cmd,
-            workdir: Some(workdir_str),
+            workdir: Some(
+                connection
+                    .container_repo_path
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             env: vec![],
         }),
         reconnect,
-    )?;
+    )
+}
 
+fn finish_attachment(outcome: pty_attach::AttachOutcome) -> Result<()> {
     match outcome {
         pty_attach::AttachOutcome::Detached => {
             eprintln!("[detached from session]");

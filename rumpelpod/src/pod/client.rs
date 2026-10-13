@@ -50,6 +50,34 @@ impl PodClient {
         Self::new(url, token, RetryPolicy::UserBlocking)
     }
 
+    pub fn connect_prepared(url: &str, token: &str) -> Result<Self> {
+        let pod = Self {
+            client: reqwest::Client::builder().gzip(true).build()?,
+            url: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        };
+        block_on(async {
+            // A client-wide timeout would also cut off long file transfers.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let url = &pod.url;
+                let response = pod
+                    .client
+                    .get(format!("{url}/events"))
+                    .bearer_auth(&pod.token)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                match read_greeting(response, None).await? {
+                    Some(error) => Err(anyhow::anyhow!("{error}")),
+                    None => Ok(()),
+                }
+            })
+            .await
+            .context("timed out connecting to prepared pod")?
+        })?;
+        Ok(pod)
+    }
+
     pub fn new_with_timeout(url: &str, token: &str, timeout: Duration) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()

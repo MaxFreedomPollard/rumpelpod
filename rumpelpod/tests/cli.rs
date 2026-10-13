@@ -51,6 +51,8 @@ mod pi;
 mod pipeline;
 #[path = "cli/podman.rs"]
 mod podman;
+#[path = "cli/prepared_connection.rs"]
+mod prepared_connection;
 #[path = "cli/prune.rs"]
 mod prune;
 #[path = "cli/readiness_wait.rs"]

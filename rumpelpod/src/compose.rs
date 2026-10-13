@@ -18,6 +18,7 @@ use crate::async_command::AsyncCommandExt;
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{DevContainer, MountObject, MountType, StringOrArray};
 use crate::image::{apply_docker_host, OutputLine};
+use crate::ssh_agent::ManagedSshAgent;
 
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 const BUILD_CACHE_DOMAIN: &[u8] = b"rumpelpod compose build cache v1";
@@ -87,14 +88,39 @@ impl Source {
         host: &Host,
         docker_socket: Option<&Path>,
         ssh_auth_sock: Option<&Path>,
-        services: &[String],
+        model: &Model,
+        repo_root: &Path,
         client_env: &HashMap<String, String>,
         progress: &std::sync::mpsc::Sender<OutputLine>,
     ) -> Result<()> {
         let mut command = docker_compose_command(host, docker_socket)?;
         self.apply(&mut command, project_name);
+        let ssh = model.build_ssh()?;
+        let build_agent = if ssh.is_empty() {
+            None
+        } else {
+            ManagedSshAgent::for_build(repo_root).await?
+        };
+        let _ssh_override = if let Some(agent) = build_agent.as_ref() {
+            let file =
+                tempfile::NamedTempFile::new().context("creating compose build SSH override")?;
+            let mut yaml = "services:\n".to_string();
+            for (service, sources) in ssh {
+                let service = yaml_scalar(&service);
+                // SSH lists otherwise merge, leaving the original sources available.
+                yaml.push_str(&format!("  {service}:\n    build:\n      ssh: !override\n"));
+                for source in sources {
+                    let source = yaml_scalar(&agent.build_source(&source));
+                    yaml.push_str(&format!("        - {source}\n"));
+                }
+            }
+            fs::write(file.path(), yaml).context("writing compose build SSH override")?;
+            command.arg("--file").arg(file.path());
+            Some(file)
+        } else {
+            None
+        };
         command.args(["build", "--with-dependencies"]);
-        command.args(services);
         command.current_dir(&self.working_dir);
         command.envs(client_env);
         if let Some(socket) = ssh_auth_sock {
@@ -237,6 +263,40 @@ impl Model {
             .service(service)?
             .get("build")
             .is_some_and(|build| !build.is_null()))
+    }
+
+    fn build_ssh(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut services = BTreeMap::new();
+        for service in self.services() {
+            if let Some(ssh) = self
+                .service(&service)?
+                .get("build")
+                .and_then(|build| build.get("ssh"))
+            {
+                match ssh {
+                    Value::Null => {}
+                    Value::Array(entries) => {
+                        if !entries.is_empty() {
+                            let sources = entries
+                                .iter()
+                                .map(|entry| {
+                                    entry.as_str().map(str::to_owned).with_context(|| {
+                                        format!("compose service '{service}' has invalid build SSH source")
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            services.insert(service, sources);
+                        }
+                    }
+                    Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+                        return Err(anyhow::anyhow!(
+                            "compose service '{service}' has invalid build SSH configuration"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(services)
     }
 
     /// Compute project-independent tags for the images produced by Compose.

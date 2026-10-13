@@ -363,7 +363,7 @@ fn subdir_submodule_pod_commit_syncs_to_host() {
     );
 }
 
-/// Create a three-level hierarchy: grandparent -> outer-sub -> inner-sub.
+/// Create a three-level hierarchy: grandparent -> outer-sub -> inner=sub.
 /// Returns (grandparent, outer_child, inner_child, outer_name, inner_displaypath).
 fn create_test_repo_with_nested_submodules() -> (TestRepo, TestRepo, TestRepo, String, String) {
     let inner = TestRepo::new();
@@ -371,7 +371,7 @@ fn create_test_repo_with_nested_submodules() -> (TestRepo, TestRepo, TestRepo, S
 
     let outer = TestRepo::new();
 
-    let inner_name = "inner-sub";
+    let inner_name = "inner=sub";
     Command::new("git")
         .args([
             "-c",
@@ -423,6 +423,57 @@ fn create_test_repo_with_nested_submodules() -> (TestRepo, TestRepo, TestRepo, S
         outer_name.to_string(),
         inner_displaypath,
     )
+}
+
+#[test]
+fn nested_submodule_gateway_credentials_are_scoped() {
+    let (parent, _child, _grandchild, child_name, grandchild_name) =
+        create_test_repo_with_nested_submodules();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&parent, "", "");
+    fs::write(parent.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let script = indoc! {r#"
+        set -eu
+        for repo in . "$1" "$2"; do
+            (
+                cd "$repo"
+                host=$(git remote get-url host)
+                pod=$(git remote get-url rumpelpod)
+                test "$host" = "$pod"
+                header=$(git config --get-urlmatch http.extraHeader "$host")
+                case "$header" in
+                    'Authorization: Bearer '*) ;;
+                    *) echo 'missing gateway credential' >&2; exit 1 ;;
+                esac
+                for url in https://example.invalid/unrelated.git "${host}-other"; do
+                    if git config --get-urlmatch http.extraHeader "$url" >/dev/null; then
+                        echo 'credential matches unrelated URL' >&2
+                        exit 1
+                    fi
+                done
+                git fetch host
+                git fetch rumpelpod
+            )
+        done
+    "#};
+    pod_command(&parent, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "nested-auth-scope",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            &child_name,
+            &grandchild_name,
+        ])
+        .success()
+        .expect("nested submodules must authenticate only to their own gateway URLs");
 }
 
 #[test]

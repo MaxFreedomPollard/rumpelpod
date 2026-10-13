@@ -6,6 +6,7 @@
 //! Tests verify that pods can push branches to refs/rumpelpod/ in the host repo
 //! and that access control restricts cross-pod writes.
 
+mod hook;
 mod submodules;
 
 use std::collections::BTreeSet;
@@ -13,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use indoc::formatdoc;
+use indoc::{formatdoc, indoc};
 use rumpelpod::CommandExt;
 use sha2::{Digest, Sha256};
 
@@ -163,6 +164,75 @@ fn gateway_http_remotes_configured_in_container() {
         "Container should have remote, got: {}",
         remotes
     );
+}
+
+#[test]
+fn gateway_credentials_are_scoped_to_host_remotes() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "RUN apk add --no-cache socat", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    // An unrelated HTTP remote must never receive the pod's bearer token,
+    // including on the first request before any authentication challenge.
+    let script = indoc! {r#"
+        set -eu
+        gateway=$(git remote get-url host)
+        header=$(git config --get-urlmatch http.extraHeader "$gateway")
+        case "$header" in
+            'Authorization: Bearer '*) ;;
+            *) echo 'missing gateway credential' >&2; exit 1 ;;
+        esac
+        for remote in host rumpelpod; do
+            url=$(git remote get-url "$remote")
+            test "$(git config --get-urlmatch http.extraHeader "$url")" = "$header"
+            git fetch "$remote"
+        done
+        test "$(git config --get-urlmatch http.extraHeader "$gateway/info/lfs")" = "$header"
+        test "$(git config --get-urlmatch http.followRedirects "$gateway")" = false
+        base=${gateway%/rumpelpod.git}
+        port=${base##*:}
+        for url in https://example.invalid/repo.git "${gateway}-other" \
+            "$base/other.git" "https://${gateway#http://}" "http://localhost:$port/rumpelpod.git"; do
+            if git config --get-urlmatch http.extraHeader "$url" >/dev/null; then
+                echo 'credential matches an unrelated URL' >&2
+                exit 1
+            fi
+        done
+
+        cat > /tmp/http-receiver <<'EOF'
+        #!/bin/sh
+        while IFS= read -r line; do
+            printf '%s\n' "$line" >> /tmp/http-requests
+            test "$line" != "$(printf '\r')" || break
+        done
+        printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+        EOF
+        chmod +x /tmp/http-receiver
+        socat TCP-LISTEN:32891,bind=127.0.0.1,reuseaddr,fork EXEC:/tmp/http-receiver &
+        receiver=$!
+        trap 'kill "$receiver"; wait "$receiver" || test "$?" -eq 143' EXIT
+        for attempt in $(seq 1 100); do
+            if git ls-remote http://127.0.0.1:32891/unrelated.git >/tmp/git-result 2>&1; then
+                echo 'expected the unrelated remote to return 404' >&2
+                exit 1
+            fi
+            test ! -s /tmp/http-requests || break
+            kill -0 "$receiver"
+            sleep 0.05
+        done
+        test -s /tmp/http-requests
+        if grep -qi '^Authorization:' /tmp/http-requests; then
+            echo 'Git leaked an Authorization header' >&2
+            exit 1
+        fi
+    "#};
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "auth-scope", "--", "sh", "-c", script])
+        .success()
+        .expect("gateway credentials must only authenticate the gateway remotes");
 }
 
 #[test]
@@ -3019,7 +3089,7 @@ fn gateway_lfs_rejects_invalid_oid_paths() {
     let download_script = formatdoc! {r#"
         set -eu
         url=$(git config --get remote.host.url)
-        header=$(git config --get http.extraHeader)
+        header=$(git config --get-urlmatch http.extraHeader "$url")
         curl --path-as-is -sS -o /tmp/lfs-download-body -w '%{{http_code}}' \
             -H "$header" \
             "$url/lfs/objects/{encoded_secret_path}"
@@ -3051,7 +3121,7 @@ fn gateway_lfs_rejects_invalid_oid_paths() {
     let batch_script = formatdoc! {r#"
         set -eu
         url=$(git config --get remote.host.url)
-        header=$(git config --get http.extraHeader)
+        header=$(git config --get-urlmatch http.extraHeader "$url")
         curl -sS -o /tmp/lfs-batch-body -w '%{{http_code}}' \
             -H "$header" \
             -H 'Content-Type: application/vnd.git-lfs+json' \
@@ -3081,7 +3151,7 @@ fn gateway_lfs_rejects_invalid_oid_paths() {
     let upload_script = formatdoc! {r#"
         set -eu
         url=$(git config --get remote.host.url)
-        header=$(git config --get http.extraHeader)
+        header=$(git config --get-urlmatch http.extraHeader "$url")
         curl --path-as-is -sS -o /tmp/lfs-upload-body -w '%{{http_code}}' \
             -H "$header" \
             -X PUT \
@@ -3373,11 +3443,11 @@ fn gateway_lfs_not_used() {
 }
 
 #[test]
-fn gateway_lfs_initial_push_with_leftover_image_branch() {
-    // First-enter recover_push walks every leftover image branch through
-    // prepare_lfs_for_rumpelpod_push.  An image-only commit makes that
-    // branch a strict descendant of the host remotes, so the LFS scan
-    // has to classify objects with cat-file --batch-check.
+fn gateway_lfs_initial_push_exceeds_pipe_capacity() {
+    // Image-only history forces the initial LFS scan to classify objects
+    // even though the repository has no LFS files.  32768 commit IDs exceed
+    // 1 MiB in both cat-file requests and responses, so writing all requests
+    // before draining the responses deadlocks on full pipes.
     let repo = TestRepo::new();
     std::fs::write(repo.path().join("plain.txt"), "hello\n").expect("write file");
     Command::new("git")
@@ -3389,7 +3459,17 @@ fn gateway_lfs_initial_push_with_leftover_image_branch() {
 
     let extra_dockerfile = formatdoc! {r#"
         RUN apk add --no-cache git-lfs
-        RUN git -C {TEST_REPO_PATH} commit --allow-empty -m 'image-only leftover commit'
+        RUN cd {TEST_REPO_PATH} && base=$(git rev-parse HEAD) && \
+            awk -v base="$base" 'BEGIN {{ \
+                for (i = 0; i < 32768; i++) {{ \
+                    message = "image-only commit " i; \
+                    printf "commit refs/heads/image-only\n"; \
+                    printf "committer Test User <test@example.com> 946684800 +0000\n"; \
+                    printf "data %d\n%s\n", length(message), message; \
+                    if (i == 0) printf "from %s\n", base; \
+                    printf "\n"; \
+                }} \
+            }}' | git fast-import --quiet
     "#};
     let home = TestHome::new();
     let executor = ExecutorResources::setup(&home);
@@ -3398,18 +3478,32 @@ fn gateway_lfs_initial_push_with_leftover_image_branch() {
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
     let pod_name = "lfs-leftover";
 
-    pod_command(&repo, &daemon)
-        .args(["enter", "--create", pod_name, "--", "cat", "plain.txt"])
+    let output = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            pod_name,
+            "--",
+            "git",
+            "rev-parse",
+            "refs/heads/image-only",
+        ])
         .success()
-        .expect(
-            "initial enter should succeed when leftover image branches are ahead of host remotes",
-        );
+        .expect("initial enter should finish when the LFS scan exceeds pipe capacity");
+    let image_commit = String::from_utf8(output).expect("image commit should be UTF-8");
 
-    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
-    assert!(
-        get_pod_ref_commit(repo.path(), &expected_ref).is_some(),
-        "initial recover_push should publish {expected_ref}"
+    let expected_ref = format!("refs/rumpelpod/image-only@{pod_name}");
+    assert_eq!(
+        get_pod_ref_commit(repo.path(), &expected_ref).as_deref(),
+        Some(image_commit.trim()),
+        "initial recover_push should publish the entire image-only history"
     );
+
+    let output = pod_command(&repo, &daemon)
+        .args(["enter", pod_name, "--", "cat", "plain.txt"])
+        .success()
+        .expect("reentry should finish after the initial push releases the lifecycle lock");
+    assert_eq!(output, b"hello\n");
 }
 
 #[test]
@@ -3720,7 +3814,7 @@ fn gateway_reconnect_push() {
     // Create a commit inside the container while the daemon is down.
     // The tunnel-server exits on stdin close so the hook push gets
     // connection refused.
-    Command::new("docker")
+    let output = Command::new("docker")
         .args([
             "exec",
             &container_id,
@@ -3736,8 +3830,11 @@ fn gateway_reconnect_push() {
             "-m",
             "offline commit",
         ])
-        .success()
+        .output()
         .expect("docker exec git commit failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "offline commit failed: {stderr}");
+    assert!(stderr.is_empty(), "offline push should be quiet: {stderr}");
 
     let rev_output = Command::new("docker")
         .args([
@@ -4005,4 +4102,27 @@ fn gateway_push_after_daemon_restart_refreshes_changed_tunnel_port() {
         .args(["enter", "--create", pod_name, "--", "sh", "-c", push_script])
         .success()
         .expect("git push rumpelpod should work after daemon restart");
+
+    let check_old_url = indoc! {r#"
+        set -eu
+        if git config --get-urlmatch http.extraHeader "$1" >/dev/null; then
+            echo 'obsolete tunnel URL still has a credential' >&2
+            exit 1
+        fi
+        url=$(git remote get-url host)
+        test -n "$(git config --get-urlmatch http.extraHeader "$url")"
+    "#};
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            pod_name,
+            "--",
+            "sh",
+            "-c",
+            check_old_url,
+            "sh",
+            &old_url,
+        ])
+        .success()
+        .expect("gateway refresh must remove credentials for the old tunnel URL");
 }

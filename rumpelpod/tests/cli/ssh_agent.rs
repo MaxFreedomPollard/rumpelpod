@@ -5,19 +5,23 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use indoc::{formatdoc, indoc};
 use rumpelpod::daemon::protocol::{ClientContext, PodReconnectRequest};
 use rumpelpod::CommandExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
-use crate::executor::ExecutorResources;
+use crate::common::{
+    pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH, TEST_USER,
+};
+use crate::executor::{ExecutorMode, ExecutorResources};
 
 struct TestSshAgent {
     child: Option<Child>,
@@ -763,4 +767,348 @@ fn ssh_agent_keys_and_ambient_are_rejected_together() {
         stderr.contains("sshAgent.keys and sshAgent.ambient are mutually exclusive"),
         "unexpected error: {stderr}"
     );
+}
+
+fn enable_build_ssh(repo: &TestRepo, options: Value) {
+    let path = repo.path().join(".devcontainer/devcontainer.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["build"]["options"] = options;
+    fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+fn require_build_transport_agent(home: &TestHome, socket: &Path) {
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::read_link(&docker).expect("resolve real Docker CLI");
+    let real_docker = real_docker.display();
+    let socket = socket.display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        for arg in "$@"; do
+            if [ "$arg" = build ] && [ "$SSH_AUTH_SOCK" != '{socket}' ]; then
+                echo 'build replaced the Docker transport agent' >&2
+                exit 1
+            fi
+        done
+        exec '{real_docker}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn record_loaded_agent_sockets(home: &TestHome) -> PathBuf {
+    let ssh_add = home.bin_dir().join("ssh-add");
+    let real_ssh_add = fs::read_link(&ssh_add).unwrap();
+    let real_ssh_add = real_ssh_add.display();
+    let log = home.path().join("loaded-agent-sockets");
+    let log_path = log.display();
+    fs::remove_file(&ssh_add).unwrap();
+    fs::write(
+        &ssh_add,
+        formatdoc! {r#"
+        #!/bin/sh
+        printf '%s\n' "$SSH_AUTH_SOCK" >> '{log_path}'
+        exec '{real_ssh_add}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&ssh_add, fs::Permissions::from_mode(0o755)).unwrap();
+    log
+}
+
+#[test]
+fn ssh_agent_build_uses_only_configured_keys_separately_from_pod_agent() {
+    let home = TestHome::new();
+    home.link_local_bin("ssh-add");
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let loaded_sockets = record_loaded_agent_sockets(&home);
+    let ambient = TestSshAgent::start(&home, "ambient-build");
+    if matches!(
+        crate::executor::executor_mode(),
+        ExecutorMode::Docker | ExecutorMode::Ssh
+    ) {
+        require_build_transport_agent(&home, &ambient.socket_path);
+    }
+    generate_key(&home, "first", "first-build-key");
+    let second = generate_key(&home, "second", "second-build-key");
+    let repo = TestRepo::new();
+    fs::copy(second, repo.path().join("second-key")).unwrap();
+    write_ssh_agent_config(
+        &repo,
+        &executor,
+        serde_json::json!({"keys": ["~/first_ed25519", "second-key"]}),
+    );
+    write_test_devcontainer(
+        &repo,
+        indoc! {r#"
+        RUN --mount=type=ssh --mount=type=ssh,id=deploy,target=/tmp/deploy.sock ssh-add -L > /tmp/build-keys && test "$(SSH_AUTH_SOCK=/tmp/deploy.sock ssh-add -L)" = "$(cat /tmp/build-keys)"
+    "#},
+        "",
+    );
+    let ambient_socket = ambient.socket_path.display();
+    enable_build_ssh(
+        &repo,
+        serde_json::json!([
+            "--ssh",
+            format!("default={ambient_socket}"),
+            format!("--ssh=deploy={ambient_socket}")
+        ]),
+    );
+
+    let output = pod_command(&repo, &daemon)
+        .env("SSH_AUTH_SOCK", &ambient.socket_path)
+        .args([
+            "enter",
+            "--create",
+            "configured-build",
+            "--",
+            "cat",
+            "/tmp/build-keys",
+        ])
+        .success()
+        .expect("build with configured SSH keys");
+    let keys = String::from_utf8(output).unwrap();
+    assert_eq!(keys.lines().count(), 2, "unexpected build keys: {keys}");
+    assert!(keys.contains("first-build-key"), "{keys}");
+    assert!(keys.contains("second-build-key"), "{keys}");
+    assert!(!keys.contains(&ambient.comment), "{keys}");
+    assert_agent_comment(&repo, &daemon, "configured-build", None, "first-build-key");
+    assert_agent_comment(&repo, &daemon, "configured-build", None, "second-build-key");
+    let sockets = fs::read_to_string(loaded_sockets).unwrap();
+    let sockets: Vec<_> = sockets.lines().collect();
+    assert_eq!(
+        sockets.len(),
+        3,
+        "pod, base build and preparation each need an agent"
+    );
+    assert!(
+        Path::new(sockets[0]).exists(),
+        "pod agent must remain alive"
+    );
+    assert_ne!(sockets[1], sockets[2], "builds must use separate agents");
+    for socket in &sockets[1..] {
+        assert!(
+            !Path::new(socket).exists(),
+            "build socket left behind: {socket}"
+        );
+    }
+}
+
+#[test]
+fn ssh_agent_image_build_gets_fresh_configured_agent_without_ambient_socket() {
+    let home = TestHome::new();
+    home.link_local_bin("ssh-add");
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let loaded_sockets = record_loaded_agent_sockets(&home);
+    let key = generate_key(&home, "build", "configured-build-key");
+    let public_key = fs::read_to_string(key.with_extension("pub")).unwrap();
+    let public_key = public_key.trim();
+    let repo = TestRepo::new();
+    write_ssh_agent_config(&repo, &executor, serde_json::json!({"keys": [key]}));
+    write_test_devcontainer(
+        &repo,
+        &formatdoc! {r#"
+        RUN --mount=type=ssh test "$(ssh-add -L)" = '{public_key}'
+    "#},
+        "",
+    );
+    enable_build_ssh(&repo, serde_json::json!(["--ssh", "default"]));
+
+    for _ in 0..2 {
+        pod_command(&repo, &daemon)
+            .env_remove("SSH_AUTH_SOCK")
+            .args(["image", "build", "--no-cache"])
+            .success()
+            .expect("build with a fresh configured agent");
+    }
+    let sockets = fs::read_to_string(loaded_sockets).unwrap();
+    let sockets: Vec<_> = sockets.lines().collect();
+    assert_eq!(sockets.len(), 2);
+    assert_ne!(
+        sockets[0], sockets[1],
+        "each build must create a fresh agent"
+    );
+    for socket in sockets {
+        assert!(
+            !Path::new(socket).exists(),
+            "build socket left behind: {socket}"
+        );
+    }
+    assert_agent_comment(
+        &repo,
+        &daemon,
+        "build-without-ambient",
+        None,
+        "configured-build-key",
+    );
+}
+
+#[test]
+fn ssh_agent_image_build_preserves_unset_and_ambient_forwarding() {
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let ambient = TestSshAgent::start(&home, "ambient-image-build");
+    let repo = TestRepo::new();
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let comment = &ambient.comment;
+    write_test_devcontainer(
+        &repo,
+        &formatdoc! {r#"
+        RUN --mount=type=ssh ssh-add -L | grep '{comment}'
+    "#},
+        "",
+    );
+    enable_build_ssh(&repo, serde_json::json!(["--ssh=default"]));
+    // With no ssh-agent executable, success also proves no managed build
+    // agent was started for either ambient configuration.
+    fs::remove_file(home.bin_dir().join("ssh-agent")).unwrap();
+    pod_command(&repo, &daemon)
+        .env("SSH_AUTH_SOCK", &ambient.socket_path)
+        .args(["image", "build", "--no-cache"])
+        .success()
+        .expect("build with unset sshAgent");
+    write_ssh_agent_config(&repo, &executor, serde_json::json!({"ambient": true}));
+    pod_command(&repo, &daemon)
+        .env("SSH_AUTH_SOCK", &ambient.socket_path)
+        .args(["image", "build", "--no-cache"])
+        .success()
+        .expect("build with ambient sshAgent");
+}
+
+#[test]
+fn ssh_agent_image_build_without_ssh_does_not_load_configured_keys() {
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let repo = TestRepo::new();
+    write_ssh_agent_config(
+        &repo,
+        &executor,
+        serde_json::json!({"keys": ["missing-key"]}),
+    );
+    write_test_devcontainer(&repo, "RUN test -z \"$SSH_AUTH_SOCK\"", "");
+    fs::remove_file(home.bin_dir().join("ssh-agent")).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["image", "build"])
+        .success()
+        .expect("build without SSH must not start an agent or read its keys");
+}
+
+#[test]
+fn ssh_agent_image_build_rejects_invalid_configured_keys() {
+    let home = TestHome::new();
+    home.link_local_bin("ssh-add");
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let repo = TestRepo::new();
+    write_test_devcontainer(&repo, "RUN --mount=type=ssh ssh-add -l", "");
+    enable_build_ssh(&repo, serde_json::json!(["--ssh=default"]));
+    for (name, expected) in [
+        ("missing-key", "reading configured SSH key"),
+        ("malformed-key", "ssh-add failed"),
+    ] {
+        fs::write(repo.path().join("malformed-key"), "not a private key").unwrap();
+        write_ssh_agent_config(&repo, &executor, serde_json::json!({"keys": [name]}));
+        let output = pod_command(&repo, &daemon)
+            .args(["image", "build"])
+            .output()
+            .expect("run build with invalid configured key");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+#[test]
+fn ssh_agent_image_build_explicit_empty_keys_excludes_ambient_keys() {
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let ambient = TestSshAgent::start(&home, "excluded-build");
+    let repo = TestRepo::new();
+    write_ssh_agent_config(&repo, &executor, serde_json::json!({"keys": []}));
+    write_test_devcontainer(
+        &repo,
+        indoc! {r#"
+        RUN --mount=type=ssh ssh-add -l > /tmp/keys; test "$?" = 1 && grep 'no identities' /tmp/keys
+    "#},
+        "",
+    );
+    enable_build_ssh(&repo, serde_json::json!(["--ssh=default"]));
+    pod_command(&repo, &daemon)
+        .env("SSH_AUTH_SOCK", &ambient.socket_path)
+        .args(["image", "build"])
+        .success()
+        .expect("explicit empty build agent");
+}
+
+#[test]
+fn ssh_agent_compose_build_uses_only_configured_keys() {
+    match crate::executor::executor_mode() {
+        ExecutorMode::Docker => {}
+        ExecutorMode::Podman | ExecutorMode::Ssh | ExecutorMode::K8s => {
+            crate::executor::skip_test();
+            return;
+        }
+    }
+    let home = TestHome::new();
+    home.link_local_bin("ssh-add");
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let ambient = TestSshAgent::start(&home, "ambient-compose-build");
+    require_build_transport_agent(&home, &ambient.socket_path);
+    let key = generate_key(&home, "compose", "configured-compose-key");
+    let public_key = fs::read_to_string(key.with_extension("pub")).unwrap();
+    let public_key = public_key.trim();
+    let repo = TestRepo::new();
+    write_ssh_agent_config(&repo, &executor, serde_json::json!({"keys": [key]}));
+    write_test_devcontainer(
+        &repo,
+        &formatdoc! {r#"
+        RUN --mount=type=ssh test "$(ssh-add -L)" = '{public_key}'
+    "#},
+        "",
+    );
+    fs::write(
+        repo.path().join(".devcontainer/compose.yaml"),
+        indoc! {r#"
+        services:
+          agent:
+            build:
+              context: ..
+              dockerfile: .devcontainer/Dockerfile
+              ssh:
+                - default
+            command: ["sleep", "infinity"]
+    "#},
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".devcontainer/devcontainer.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "dockerComposeFile": "compose.yaml",
+            "service": "agent",
+            "workspaceFolder": TEST_REPO_PATH,
+            "containerUser": TEST_USER,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_agent_comment(
+        &repo,
+        &daemon,
+        "compose-build",
+        Some(&ambient.socket_path),
+        "configured-compose-key",
+    );
+    pod_command(&repo, &daemon)
+        .args(["delete", "--force", "--wait", "compose-build"])
+        .success()
+        .expect("delete Compose SSH-build project");
 }

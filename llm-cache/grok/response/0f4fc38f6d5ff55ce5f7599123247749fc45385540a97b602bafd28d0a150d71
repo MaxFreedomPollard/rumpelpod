@@ -1,0 +1,27 @@
+{"status":200,"path":"/v1/chat/completions","headers":{"access-control-allow-origin":"*","access-control-expose-headers":"*","cache-control":"no-cache","cf-cache-status":"DYNAMIC","cf-ray":"a3cf5c22af7f232c-SJC","content-type":"text/event-stream","date":"Fri, 18 Sep 2026 09:35:19 GMT","server":"cloudflare","set-cookie":"__cf_bm=9899D2FonEiRnO.HS7uSkHbd3NLXFBf0BkQ8wngdlgk-1789724119.4652245-1.0.1.1-vE62falCHua4qWce6DMrnxUEFG461AMI4ZBefIYjr7leAN9CGIqVM1DXuOcsCJ60R4HHmQ2JvhGWgs8NZ473vfooe8ICFMgr2uAwUT7ZEvUuy4EILiq8rANnZQZ2CUOJ; HttpOnly; SameSite=None; Secure; Path=/; Domain=x.ai; Expires=Fri, 18 Sep 2026 10:05:19 GMT","strict-transport-security":"max-age=31536000","traceparent":"00-51be055305e5ef4e05437f128646a106-82d05c5800025785-01","vary":"origin, access-control-request-method, access-control-request-headers","x-data-retention":"zdr","x-ratelimit-limit-requests":"1800","x-ratelimit-limit-tokens":"10000000","x-ratelimit-remaining-requests":"1800","x-ratelimit-remaining-tokens":"10000000","x-request-id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","x-zero-data-retention":"true"}}
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":"**","role":"assistant"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":"Paris"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":"**\n\n"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":"The"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":" capital"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":" of"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":" France"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":" is"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":" Paris"}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{"content":"."}}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: {"id":"d86d616d-1b72-9a09-9e14-d7fe0f83384e","object":"chat.completion.chunk","created":1789724120,"model":"grok-4.20-0309-non-reasoning","choices":[],"usage":{"prompt_tokens":10153,"completion_tokens":10,"total_tokens":10163,"prompt_tokens_details":{"text_tokens":10153,"audio_tokens":0,"image_tokens":0,"cached_tokens":10132},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"num_sources_used":0,"cost_in_usd_ticks":20776500},"system_fingerprint":"fp_babf5254ba","service_tier":"default"}
+
+data: [DONE]
+

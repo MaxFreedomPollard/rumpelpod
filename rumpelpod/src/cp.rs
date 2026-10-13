@@ -195,20 +195,25 @@ pub fn cp(cmd: &CpCommand) -> Result<()> {
     };
 
     let repo_root = get_repo_root()?;
-    let socket_path = daemon::socket_path()?;
-    let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root, true, false)?;
-    if !pods.iter().any(|p| p.name == pod_name) {
-        return Err(anyhow::anyhow!("pod '{pod_name}' does not exist"));
-    }
-
-    let result = enter::launch_pod(
-        pod_name,
-        cmd.container_config.resolve_host()?,
-        cmd.container_config.devcontainer.clone(),
-    )?;
-    let repo_path = result.container_repo_path.clone();
-    let client = PodClient::connect(&result.container_url, &result.container_token)?;
+    let (connection, client) = match enter::prepared_pod_connection(pod_name, &repo_root)? {
+        Some(prepared) => prepared,
+        None => {
+            let socket_path = daemon::socket_path()?;
+            let client = DaemonClient::new_unix(&socket_path);
+            let pods = client.list_pods(repo_root, true, false)?;
+            if !pods.iter().any(|p| p.name == pod_name) {
+                return Err(anyhow::anyhow!("pod '{pod_name}' does not exist"));
+            }
+            let result = enter::launch_pod(
+                pod_name,
+                cmd.container_config.resolve_host()?,
+                cmd.container_config.devcontainer.clone(),
+            )?;
+            let pod = PodClient::connect(&result.container_url, &result.container_token)?;
+            (result.into(), pod)
+        }
+    };
+    let repo_path = connection.container_repo_path;
 
     match &direction {
         CopyDirection::FromPod {

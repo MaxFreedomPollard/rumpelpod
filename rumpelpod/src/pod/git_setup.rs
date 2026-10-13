@@ -7,6 +7,7 @@
 //! the pod can push/fetch through the gateway.
 
 use std::collections::HashSet;
+use std::env::VarError;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -371,17 +372,86 @@ fn configure_remotes(repo_path: &Path, remotes: &[GitRemote]) -> Result<()> {
 }
 
 fn configure_gateway_urls(repo_path: &Path, repo_url: &str, token: &str) -> Result<()> {
+    for remote in MANAGED_REMOTES {
+        let output = Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "--get",
+                &format!("remote.{remote}.url"),
+            ])
+            .current_dir(repo_path)
+            .output()
+            .context("reading previous gateway URL")?;
+        match output.status.code() {
+            Some(0) => {
+                let old_url = std::str::from_utf8(&output.stdout)
+                    .context("non-UTF-8 gateway URL")?
+                    .trim();
+                if old_url != repo_url {
+                    // A retired tunnel port can be reused by an unrelated server.
+                    for setting in ["extraHeader", "followRedirects"] {
+                        unset_git_config(repo_path, &format!("http.{old_url}.{setting}"))?;
+                    }
+                }
+            }
+            Some(1) => {}
+            _ => return Err(anyhow::anyhow!("reading previous gateway URL failed")),
+        }
+    }
+
+    run_git_with_secret(
+        Command::new("git")
+            .args([
+                "config",
+                &format!("http.{repo_url}.extraHeader"),
+                &format!("Authorization: Bearer {token}"),
+            ])
+            .current_dir(repo_path),
+        token,
+    )?;
+    // Git matches HTTP options against the initial URL, not redirect targets.
     Command::new("git")
         .args([
             "config",
-            "http.extraHeader",
-            &format!("Authorization: Bearer {token}"),
+            &format!("http.{repo_url}.followRedirects"),
+            "false",
         ])
         .current_dir(repo_path)
         .success()?;
     set_remote_url(repo_path, "host", repo_url)?;
     set_remote_url(repo_path, "rumpelpod", repo_url)?;
     Ok(())
+}
+
+// CommandExt::success includes argv in errors, which would expose the token.
+fn run_git_with_secret(command: &mut Command, token: &str) -> Result<()> {
+    let output = command
+        .output()
+        .context("running Git with gateway credentials")?;
+    if !output.status.success() {
+        let status = output.status;
+        let stderr = String::from_utf8_lossy(&output.stderr).replace(token, "[REDACTED]");
+        return Err(anyhow::anyhow!(
+            "Git with gateway credentials failed ({status}): {stderr}"
+        ));
+    }
+    Ok(())
+}
+
+fn unset_git_config(repo_path: &Path, key: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--local", "--unset-all", key])
+        .current_dir(repo_path)
+        .output()
+        .with_context(|| format!("removing Git setting {key}"))?;
+    match output.status.code() {
+        Some(0) | Some(5) => Ok(()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow::anyhow!("removing Git setting {key}: {stderr}"))
+        }
+    }
 }
 
 fn set_remote_url(repo_path: &Path, remote: &str, url: &str) -> Result<()> {
@@ -730,19 +800,8 @@ fn refresh_submodule_gateway_url(
         .success()
         .with_context(|| format!("updating URL for submodule '{displaypath}'"))?;
 
-    Command::new("git")
-        .args([
-            "config",
-            "http.extraHeader",
-            &format!("Authorization: Bearer {token}"),
-        ])
-        .current_dir(&sub_path)
-        .success()
-        .with_context(|| format!("updating auth for submodule '{displaypath}'"))?;
-    set_remote_url(&sub_path, "host", &sub_url)
-        .with_context(|| format!("updating host remote for submodule '{displaypath}'"))?;
-    set_remote_url(&sub_path, "rumpelpod", &sub_url)
-        .with_context(|| format!("updating rumpelpod remote for submodule '{displaypath}'"))?;
+    configure_gateway_urls(&sub_path, &sub_url, token)
+        .with_context(|| format!("updating gateway for submodule '{displaypath}'"))?;
     Ok(())
 }
 
@@ -783,11 +842,37 @@ pub fn setup_submodules_impl(req: &GitSetupSubmodulesRequest) -> Result<()> {
                     .args(["config", &sub_config_key, &sub_url])
                     .current_dir(parent_dir)
                     .success()?;
-                let auth_header = format!("http.extraHeader=Authorization: Bearer {token}");
-                Command::new("git")
-                    .args(["-c", &auth_header, "submodule", "update", &sub.path])
-                    .current_dir(parent_dir)
-                    .success()?;
+                // Submodule paths can contain '=', so keep configuration keys
+                // separate from values instead of using Git's -c key=value syntax.
+                let config_count = match std::env::var("GIT_CONFIG_COUNT") {
+                    Ok(value) => value.parse::<usize>().context("invalid GIT_CONFIG_COUNT")?,
+                    Err(VarError::NotPresent) => 0,
+                    Err(error) => return Err(error).context("reading GIT_CONFIG_COUNT"),
+                };
+                let new_count = config_count
+                    .checked_add(2)
+                    .context("GIT_CONFIG_COUNT overflow")?;
+                let redirect_index = config_count + 1;
+                run_git_with_secret(
+                    Command::new("git")
+                        .args(["submodule", "update", &sub.path])
+                        .env("GIT_CONFIG_COUNT", new_count.to_string())
+                        .env(
+                            format!("GIT_CONFIG_KEY_{config_count}"),
+                            format!("http.{sub_url}.extraHeader"),
+                        )
+                        .env(
+                            format!("GIT_CONFIG_VALUE_{config_count}"),
+                            format!("Authorization: Bearer {token}"),
+                        )
+                        .env(
+                            format!("GIT_CONFIG_KEY_{redirect_index}"),
+                            format!("http.{sub_url}.followRedirects"),
+                        )
+                        .env(format!("GIT_CONFIG_VALUE_{redirect_index}"), "false")
+                        .current_dir(parent_dir),
+                    token,
+                )?;
 
                 // Recurse into the cloned submodule for nested submodules.
                 let sub_worktree = parent_dir.join(&sub.path);
@@ -856,26 +941,7 @@ fn configure_submodule(
         sub_path.join(&git_dir_relative)
     };
 
-    Command::new("git")
-        .args([
-            "config",
-            "http.extraHeader",
-            &format!("Authorization: Bearer {token}"),
-        ])
-        .current_dir(&sub_path)
-        .success()?;
-
-    if Command::new("git")
-        .args(["remote", "add", "host", &sub_url])
-        .current_dir(&sub_path)
-        .success()
-        .is_err()
-    {
-        Command::new("git")
-            .args(["remote", "set-url", "host", &sub_url])
-            .current_dir(&sub_path)
-            .success()?;
-    }
+    configure_gateway_urls(&sub_path, &sub_url, token)?;
     let _ = Command::new("git")
         .args(["config", "--unset-all", "remote.host.fetch"])
         .current_dir(&sub_path)
@@ -903,17 +969,6 @@ fn configure_submodule(
         .current_dir(&sub_path)
         .success()?;
 
-    if Command::new("git")
-        .args(["remote", "add", "rumpelpod", &sub_url])
-        .current_dir(&sub_path)
-        .success()
-        .is_err()
-    {
-        Command::new("git")
-            .args(["remote", "set-url", "rumpelpod", &sub_url])
-            .current_dir(&sub_path)
-            .success()?;
-    }
     let _ = Command::new("git")
         .args(["config", "--unset-all", "remote.rumpelpod.push"])
         .current_dir(&sub_path)

@@ -18,6 +18,7 @@ use walkdir::WalkDir;
 use crate::async_command::{foreground, AsyncCommandExt};
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{BuildOptions, DevContainer};
+use crate::ssh_agent::configure_build_ssh;
 
 /// Set the target flag on a Docker-compatible container command.
 ///
@@ -295,6 +296,8 @@ pub async fn resolve_image_async(
     if flags.pull {
         extra_args.push("--pull".into());
     }
+
+    let _build_agent = configure_build_ssh(repo_root, &mut extra_args).await?;
 
     run_buildx_build_async(
         &image_name,

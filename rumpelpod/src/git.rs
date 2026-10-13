@@ -267,25 +267,31 @@ fn small_blob_ids(repo_path: &Path, object_ids: &[String]) -> Result<Vec<String>
         .spawn()
         .context("spawning git cat-file --batch-check")?;
 
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("git cat-file stdin was not captured"))?;
-        for object_id in object_ids {
-            writeln!(stdin, "{object_id}").context("writing git object id")?;
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("waiting for git cat-file --batch-check")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git cat-file stdin was not captured"))?;
+    // Git can fill stdout before it consumes all requests. Drain both output
+    // pipes while writing, and close stdin in the writer so Git can reach EOF.
+    let (output, input_result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> Result<()> {
+            for object_id in object_ids {
+                writeln!(stdin, "{object_id}").context("writing git object id")?;
+            }
+            Ok(())
+        });
+        let output = child.wait_with_output();
+        let input_result = writer.join().expect("git cat-file stdin writer panicked");
+        (output, input_result)
+    });
+    let output = output.context("waiting for git cat-file --batch-check")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow::anyhow!(
             "git cat-file --batch-check failed: {stderr}"
         ));
     }
+    input_result?;
 
     let listing = String::from_utf8(output.stdout).context("cat-file output was not UTF-8")?;
     let mut blob_ids = Vec::new();

@@ -581,7 +581,7 @@ pub enum WorkspaceCloneMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshAgentConfig {
     /// Private key files loaded into rumpelpod's isolated per-pod agent.
-    pub keys: Vec<PathBuf>,
+    pub keys: Option<Vec<PathBuf>>,
     /// Forward the invoking user's agent instead of using the per-pod agent.
     pub ambient: bool,
 }
@@ -590,7 +590,7 @@ pub struct SshAgentConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SshAgentConfigFields {
     #[serde(default)]
-    keys: Vec<PathBuf>,
+    keys: Option<Vec<PathBuf>>,
     #[serde(default)]
     ambient: bool,
 }
@@ -601,7 +601,7 @@ impl<'de> Deserialize<'de> for SshAgentConfig {
         D: serde::Deserializer<'de>,
     {
         let fields = SshAgentConfigFields::deserialize(deserializer)?;
-        if fields.ambient && !fields.keys.is_empty() {
+        if fields.ambient && fields.keys.as_ref().is_some_and(|keys| !keys.is_empty()) {
             return Err(serde::de::Error::custom(
                 "sshAgent.keys and sshAgent.ambient are mutually exclusive",
             ));

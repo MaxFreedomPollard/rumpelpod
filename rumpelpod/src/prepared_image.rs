@@ -721,6 +721,7 @@ async fn ensure_buildable_tag(
 ///   can switch to it at runtime.
 pub async fn build_prepared_image_async(
     base_image: &Image,
+    repo_root: &Path,
     docker_host: &Host,
     git_dir: &Path,
     workspace_clone: WorkspaceCloneMode,
@@ -865,6 +866,7 @@ pub async fn build_prepared_image_async(
     )?;
     let mut extra_args = vec![format!("--build-arg=BASE_USER={image_user}")];
     extra_args.extend(build_options.iter().cloned());
+    let _build_agent = crate::ssh_agent::configure_build_ssh(repo_root, &mut extra_args).await?;
 
     let dockerfile = build_ctx.path().join("Dockerfile");
 
@@ -1262,7 +1264,8 @@ pub fn system_prompt(description_file: Option<&str>) -> String {
         `rumpelpod/` has branches from other pods on the same repo.
 
         Always commit your changes. The user interacts with your work via git, not by looking at the working tree.
-        Committing automatically pushes to the host repo.
+        Committing automatically attempts to push to the host repo.
+        Host disconnections are expected; automatic Git sync resumes on reconnect.
         Fetching from these remotes is not automatic; run `git fetch` explicitly when you need updates.
     "}
     .to_string();

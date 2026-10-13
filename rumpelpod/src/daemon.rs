@@ -40,9 +40,9 @@ use crate::git_http_server::{AmbientSshAgents, GitHttpServer, SharedGitServerSta
 use connections::Connections;
 use pod_connection::{PodConnection, PodConnectionStatus, PodEndpoint, PodRepairBackoff};
 use protocol::{
-    AddForwardedPortRequest, ClientContext, ConnectPodRequest, ContainerId, Daemon, DaemonEvent,
-    EnsureClaudeConfigRequest, EnsurePiConfigRequest, ForkPodRequest, Image, LaunchResult, PodInfo,
-    PodLaunchParams, PodName, PodStatus, PortInfo,
+    AddForwardedPortRequest, ClaudeConnection, ClientContext, ConnectPodRequest, ContainerId,
+    Daemon, DaemonEvent, EnsureClaudeConfigRequest, EnsurePiConfigRequest, ForkPodRequest, Image,
+    LaunchResult, PodInfo, PodLaunchParams, PodName, PodStatus, PortInfo, PreparedPodConnection,
 };
 
 use crate::pod::types::{ClaudeState, CodexState, GitSetupParams};
@@ -374,35 +374,6 @@ pub fn ssh_agent_dir(repo_path: &Path, pod_name: &PodName) -> PathBuf {
     runtime_dir.join("rumpelpod/agents").join(hash_prefix)
 }
 
-fn resolve_ssh_key_paths(repo_root: &Path, keys: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut resolved = Vec::with_capacity(keys.len());
-    for key in keys {
-        let path = match key.to_str() {
-            Some("~") => dirs::home_dir().context("could not determine home directory")?,
-            Some(value) if value.starts_with("~/") => dirs::home_dir()
-                .context("could not determine home directory")?
-                .join(&value[2..]),
-            Some(value) if value.starts_with('~') => {
-                return Err(anyhow::anyhow!(
-                    "SSH key path '{value}' uses unsupported user-home expansion"
-                ));
-            }
-            Some(_) | None if key.is_absolute() => key.clone(),
-            Some(_) | None => repo_root.join(key),
-        };
-        let metadata = std::fs::metadata(&path).with_context(|| {
-            let path = path.display();
-            format!("reading configured SSH key {path}")
-        })?;
-        if !metadata.is_file() {
-            let path = path.display();
-            return Err(anyhow::anyhow!("configured SSH key {path} is not a file"));
-        }
-        resolved.push(path);
-    }
-    Ok(resolved)
-}
-
 pub struct DaemonServer {
     /// Upgrade path for `&self` methods that spawn work.  The daemon
     /// lives in an `Arc`; it is not `Clone`.
@@ -429,6 +400,69 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    fn prepared_connection(
+        &self,
+        request: ConnectPodRequest,
+        require_claude_config: bool,
+    ) -> Result<Option<PreparedPodConnection>> {
+        self.remember_client_context(&request.client_context);
+        let record = {
+            let conn = self.db.lock().unwrap();
+            let Some(record) = db::get_pod(&conn, &request.repo_path, &request.pod_name)? else {
+                return Ok(None);
+            };
+            match record.status {
+                db::PodStatus::Ready => {}
+                db::PodStatus::Initializing
+                | db::PodStatus::Error
+                | db::PodStatus::Stopping
+                | db::PodStatus::Deleting
+                | db::PodStatus::DeleteFailed => return Ok(None),
+            }
+            if require_claude_config && !db::has_claude_config_copied(&conn, record.id)? {
+                return Ok(None);
+            }
+            record
+        };
+        let Some(connection) = self.connections.pod(&request.repo_path, &request.pod_name) else {
+            return Ok(None);
+        };
+        // Only the readiness greeting confirms that pod setup finished.
+        match connection.status() {
+            PodConnectionStatus::Connected => {}
+            PodConnectionStatus::Connecting
+            | PodConnectionStatus::HostDisconnected
+            | PodConnectionStatus::PodDisconnected
+            | PodConnectionStatus::Stopped => return Ok(None),
+        }
+        let Some((endpoint, container_id)) = connection.exec_endpoint() else {
+            return Ok(None);
+        };
+
+        // Recreating a pod can replace its connection after the database read.
+        if endpoint.token != record.token {
+            return Ok(None);
+        }
+
+        // Host configuration edits must not change a running pod's workspace.
+        let local_env = deserialize_local_env(&record.local_env)?;
+        let devcontainer = parse_stored_devcontainer(
+            &record.devcontainer_json,
+            &request.repo_path,
+            &request.pod_name,
+            &local_env,
+        )?;
+        let host = connection.host();
+        Ok(Some(PreparedPodConnection {
+            container_id: ContainerId(container_id),
+            docker_socket: initialize_docker_socket(&host),
+            host,
+            container_url: endpoint.url,
+            container_token: endpoint.token,
+            container_repo_path: devcontainer.container_repo_path(&request.repo_path),
+        }))
+    }
+
     fn handle(&self) -> Arc<Self> {
         self.this
             .upgrade()
@@ -4079,7 +4113,8 @@ impl DaemonServer {
                         &docker_host,
                         docker_socket.as_deref(),
                         ssh_auth_sock.as_deref(),
-                        &[],
+                        &model,
+                        &repo_path,
                         &client_env,
                         &build_tx,
                     )
@@ -4236,6 +4271,7 @@ impl DaemonServer {
         let container_env_keys = container_env_keys_sorted(&devcontainer);
         let prepared = crate::prepared_image::build_prepared_image_async(
             &base_image,
+            &repo_path,
             &docker_host,
             &git_dir,
             workspace_clone,
@@ -5790,7 +5826,10 @@ impl DaemonServer {
         let config = load_json_config(repo_path)?;
         let keys = match config.ssh_agent.ambient {
             true => None,
-            false => Some(resolve_ssh_key_paths(repo_path, &config.ssh_agent.keys)?),
+            false => Some(crate::ssh_agent::resolve_ssh_key_paths(
+                repo_path,
+                config.ssh_agent.keys.as_deref().unwrap_or_default(),
+            )?),
         };
         self.connections
             .get_or_create_pod_async(
@@ -6421,6 +6460,23 @@ impl Daemon for DaemonServer {
             this.connect_pod_impl_async(request).await
         })?;
         block_on(handle).map_err(startup_join_error)?
+    }
+
+    fn prepared_pod_connection(
+        &self,
+        request: ConnectPodRequest,
+    ) -> Result<Option<PreparedPodConnection>> {
+        self.prepared_connection(request, false)
+    }
+
+    fn claude_connection(&self, request: ConnectPodRequest) -> Result<Option<ClaudeConnection>> {
+        Ok(self
+            .prepared_connection(request, true)?
+            .map(|connection| ClaudeConnection {
+                container_url: connection.container_url,
+                container_token: connection.container_token,
+                container_repo_path: connection.container_repo_path,
+            }))
     }
 
     fn ensure_claude_config(&self, request: EnsureClaudeConfigRequest) -> Result<()> {

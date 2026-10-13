@@ -13,11 +13,13 @@ use crate::cli::EnterCommand;
 use crate::config::{load_json_config, ContainerEngine, Host};
 use crate::daemon;
 use crate::daemon::protocol::{
-    ClientContext, Daemon, DaemonClient, LaunchProgress, LaunchResult, PodLaunchParams, PodName,
+    ClientContext, ConnectPodRequest, Daemon, DaemonClient, LaunchProgress, LaunchResult,
+    PodLaunchParams, PodName, PreparedPodConnection,
 };
 use crate::devcontainer::{DevContainer, GpuRequirement, HostRequirements, SubstitutionContext};
 use crate::git::{get_current_branch, get_git_user_config, get_repo_root};
 use crate::image::OutputLine;
+use crate::pod::PodClient;
 
 /// Compute the path relative from `base` to `path`.
 /// Both paths must be absolute and `path` must be under `base`.
@@ -392,6 +394,33 @@ pub fn launch_pod(
     Ok(result)
 }
 
+/// Fall back only before commands or transfers can have side effects.
+pub fn prepared_pod_connection(
+    pod_name: &str,
+    repo_root: &Path,
+) -> Result<Option<(PreparedPodConnection, PodClient)>> {
+    let socket_path = daemon::socket_path()?;
+    let client = DaemonClient::new_unix(&socket_path);
+    let Some(connection) = client.prepared_pod_connection(ConnectPodRequest {
+        pod_name: pod_name.to_string(),
+        repo_path: repo_root.to_path_buf(),
+        client_context: ClientContext::current(),
+    })?
+    else {
+        return Ok(None);
+    };
+    match PodClient::connect_prepared(&connection.container_url, &connection.container_token) {
+        Ok(pod) => {
+            trace!("using cached prepared pod connection");
+            Ok(Some((connection, pod)))
+        }
+        Err(error) => {
+            trace!("cached pod connection failed, preparing pod: {error:#}");
+            Ok(None)
+        }
+    }
+}
+
 pub fn enter(cmd: &EnterCommand) -> Result<()> {
     let t_total = Instant::now();
 
@@ -400,18 +429,22 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     let elapsed = t.elapsed();
     trace!("get_repo_root: {elapsed:?}");
 
-    let host_override = cmd.container_config.resolve_host()?;
-
-    confirm_pod_creation(&cmd.name, &repo_root, cmd.create)?;
-
-    let t = Instant::now();
-    let result = launch_pod(
-        &cmd.name,
-        host_override,
-        cmd.container_config.devcontainer.clone(),
-    )?;
-    let elapsed = t.elapsed();
-    trace!("launch_pod: {elapsed:?}");
+    let result = match prepared_pod_connection(&cmd.name, &repo_root)? {
+        Some((connection, _pod)) => connection,
+        None => {
+            let host_override = cmd.container_config.resolve_host()?;
+            confirm_pod_creation(&cmd.name, &repo_root, cmd.create)?;
+            let t = Instant::now();
+            let result = launch_pod(
+                &cmd.name,
+                host_override,
+                cmd.container_config.devcontainer.clone(),
+            )?;
+            let elapsed = t.elapsed();
+            trace!("launch_pod: {elapsed:?}");
+            result.into()
+        }
+    };
 
     let container_repo_path = result.container_repo_path.clone();
     let workdir = container_workdir(&container_repo_path, &repo_root)?;

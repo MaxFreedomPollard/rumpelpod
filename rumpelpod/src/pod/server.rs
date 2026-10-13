@@ -474,7 +474,14 @@ fn run_setup(
 
         // Existing branches do not trigger the newly installed reference
         // hook, so the first setup must publish them before the pod is ready.
-        recover_push(repo_path, pod_name).expect("initial pod branch push failed");
+        progress("pushing initial pod branches...");
+        {
+            let _slow = crate::slow_guard::SlowGuard::new(
+                "still pushing initial pod branches...",
+                slow_tx.clone(),
+            );
+            recover_push(repo_path, pod_name).expect("initial pod branch push failed");
+        }
     } else {
         progress("refreshing git remotes...");
         git_setup::refresh_gateway_urls_impl(&git_setup::GitGatewayRefreshRequest {
