@@ -44,13 +44,13 @@ fn write_devcontainer_with_unsupported(repo: &TestRepo, extra_fields: &str) {
 }
 
 #[test]
-fn warns_on_workspace_mount() {
+fn workspace_mount_does_not_warn() {
     let repo = TestRepo::new();
 
     write_devcontainer_with_unsupported(
         &repo,
-        r#",
-            "workspaceMount": "source=/host/path,target=/workspace,type=bind""#,
+        &formatdoc! {r#",
+        "workspaceMount": "source=${{localWorkspaceFolder}},target={TEST_REPO_PATH},type=bind""#},
     );
     let home = TestHome::new();
     let executor = ExecutorResources::setup(&home);
@@ -58,14 +58,23 @@ fn warns_on_workspace_mount() {
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
 
     let output = pod_command(&repo, &daemon)
-        .args(["enter", "--create", "unsupported-wsmount", "--", "true"])
+        .args(["enter", "--create", "workspace-mount", "--", "pwd"])
         .output()
         .expect("Failed to run pod command");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("workspaceMount") && stderr.contains("not supported"),
-        "stderr should warn about unsupported workspaceMount, got: {stderr}",
+        output.status.success(),
+        "rumpel enter should succeed with workspaceMount, got: {stderr}",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        TEST_REPO_PATH,
+        "workspaceMount should not interfere with the custom workspaceFolder",
+    );
+    assert!(
+        !stderr.contains("workspaceMount"),
+        "stderr should not warn about workspaceMount, got: {stderr}",
     );
 }
 
@@ -102,7 +111,7 @@ fn warns_on_multiple_unsupported() {
     write_devcontainer_with_unsupported(
         &repo,
         r#",
-            "workspaceMount": "source=/host,target=/ws,type=bind",
+            "postAttachCommand": "true",
             "appPort": 3000"#,
     );
     let home = TestHome::new();
@@ -117,8 +126,8 @@ fn warns_on_multiple_unsupported() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("workspaceMount"),
-        "stderr should warn about workspaceMount, got: {stderr}",
+        stderr.contains("postAttachCommand"),
+        "stderr should warn about postAttachCommand, got: {stderr}",
     );
     assert!(
         stderr.contains("appPort"),

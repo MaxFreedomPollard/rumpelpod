@@ -180,11 +180,11 @@ Set `workspaceFolder` in `devcontainer.json` to ensure rumpelpod uses the same p
 ### Devcontainer deviations
 
 A handful of fields are either architecturally incompatible with rumpelpod or deliberately left out.
-Rumpelpod ignores them with a warning when they appear.
+Unless noted below, rumpelpod ignores them with a warning when they appear.
 
 - `features` and `overrideFeatureInstallOrder`: use a Dockerfile to install the equivalent packages.
 - `dockerComposeFile`, `service`, `runServices`: rumpelpod operates on single containers.
-- `workspaceMount`: rumpelpod syncs the workspace via git rather than bind-mounting it.
+- `workspaceMount` is ignored without a warning: rumpelpod syncs the workspace via git into `workspaceFolder` rather than bind-mounting it.
 - `appPort`: use `forwardPorts` instead, so that rumpelpod's port tracking can remap across pods.
 - `shutdownAction`: containers stay running between sessions and are only removed explicitly with `rumpel delete`.
 - `postAttachCommand` is ignored.
