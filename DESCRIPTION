@@ -1,0 +1,9 @@
+Avoid warnings for custom workspace mounts
+
+workspaceMount commonly accompanies a non-default workspaceFolder, which
+rumpelpod already honors when syncing the repository through git. Ignore
+the mount configuration without warning so shared devcontainer configs
+do not produce unnecessary noise.
+
+Verify that entering a custom workspace succeeds without the warning,
+retain coverage for other unsupported fields, and document the behavior.

@@ -648,7 +648,6 @@ impl DevContainer {
     ///   Out of scope -- use a Dockerfile instead.
     pub fn unsupported_field_warnings(&self) -> Vec<String> {
         let fields: &[(&str, bool)] = &[
-            ("workspaceMount", self.workspace_mount.is_some()),
             ("appPort", self.app_port.is_some()),
             ("features", self.features.is_some()),
             (
