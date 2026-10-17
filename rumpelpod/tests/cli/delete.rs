@@ -154,6 +154,10 @@ fn delete_forget_never_contacts_hosts_and_continues_past_missing() {
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     let daemon = TestDaemon::start_with_env(&home, &[("KUBECONFIG", kubeconfig.to_str().unwrap())]);
+    // Socket creation precedes startup reconnection. Wait for a response so
+    // that only the forget request can initiate probes of these fixtures.
+    let output = pod_command(&repo, &daemon).arg("list").output().unwrap();
+    assert!(output.status.success());
     record_disconnected_pod(&repo, &home, "old-k8s", &retired_cluster());
     record_disconnected_pod(
         &repo,
