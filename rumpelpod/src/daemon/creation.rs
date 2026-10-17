@@ -60,6 +60,54 @@ impl CreateIntent {
     }
 }
 
+fn pending_creations() -> Result<Vec<(PathBuf, PendingCreate)>> {
+    let entries = match fs::read_dir(directory()?) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut pending = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        // Atomic writes use a temporary filename until the full record
+        // is durable. Only finalized identity filenames are actionable.
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        pending.push((path, serde_json::from_slice(&bytes)?));
+    }
+    Ok(pending)
+}
+
+// The caller holds the pod's lifecycle lease after cancelling startup, so
+// neither creation nor cleanup can race the decision to leave resources alone.
+pub(super) fn forget(repo_path: &Path, pod_name: &str) -> Result<()> {
+    let mut removed = false;
+    for (path, pending) in pending_creations()? {
+        if pending.repo_path == repo_path && pending.pod_name == pod_name {
+            match fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    if removed {
+        // A crash must not restore a cleanup obligation after its pod's
+        // database record has been forgotten.
+        fs::File::open(directory()?)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl DaemonServer {
     pub(super) fn start_creation_cleanup(self: &Arc<Self>) {
         let daemon = self.clone();
@@ -80,32 +128,18 @@ impl DaemonServer {
     }
 
     async fn cleanup_pending_creations(&self) -> Result<()> {
-        let entries = match fs::read_dir(directory()?) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            // Atomic writes use a temporary filename until the full record
-            // is durable. Only finalized identity filenames are actionable.
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
-                continue;
-            }
-            let bytes = match fs::read(entry.path()) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let pending: PendingCreate = serde_json::from_slice(&bytes)?;
+        for (path, pending) in pending_creations()? {
             let lock = self
                 .lifecycle_locks
                 .for_pod(&pending.repo_path, &pending.pod_name);
             let Ok(_lease) = lock.lease.clone().try_lock_owned() else {
                 continue;
             };
+            // Forget may have removed the intent since the directory scan.
+            // Check under its lease before acting on the stale snapshot.
+            if !path.try_exists()? {
+                continue;
+            }
             let wanted = {
                 let conn = self.db.lock().unwrap();
                 db::get_pod(&conn, &pending.repo_path, &pending.pod_name)?
@@ -121,6 +155,7 @@ impl DaemonServer {
                     .await
             })
             .await;
+            let name = &pending.creation;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => log::error!("cleaning up creation {name}: {error:#}"),

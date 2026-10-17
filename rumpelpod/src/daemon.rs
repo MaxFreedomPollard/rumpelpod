@@ -6014,6 +6014,7 @@ impl Daemon for DaemonServer {
         let lifecycle_lock = self.lifecycle_locks.for_pod(&repo_path, &pod_name.0);
         let lifecycle_guard = lifecycle_lock.acquire_for_delete();
         if forget {
+            creation::forget(&repo_path, &pod_name.0)?;
             // Do not resolve the stored host: its kubeconfig or SSH setup may
             // have disappeared along with the infrastructure being forgotten.
             self.connections.remove_pod(&repo_path, &pod_name.0);

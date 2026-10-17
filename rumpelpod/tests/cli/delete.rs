@@ -8,11 +8,14 @@ use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::time::Duration;
 
 use git2::Repository;
 use indoc::{formatdoc, indoc};
 use rumpelpod::config::{ContainerEngine, Host};
 use rumpelpod::daemon::db::{self, PodId, PodStatus};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::{executor_mode, skip_test, ExecutorMode, ExecutorResources};
@@ -21,12 +24,14 @@ use crate::executor::{executor_mode, skip_test, ExecutorMode, ExecutorResources}
 // is specifically meant to work without.
 fn record_disconnected_pod(repo: &TestRepo, home: &TestHome, name: &str, host: &Host) -> PodId {
     let conn = db::open_db(&home.path().join("state/rumpelpod/db.sqlite")).unwrap();
+    let repo_path = repo.path().display();
+    let token = format!("test-token-{repo_path}-{name}");
     let id = db::create_pod(
         &conn,
         repo.path(),
         name,
         host,
-        "test-token",
+        &token,
         "test-image",
         "{}",
         "[]",
@@ -195,6 +200,125 @@ fn delete_forget_never_contacts_hosts_and_continues_past_missing() {
 }
 
 #[test]
+fn delete_forget_clears_pending_creations_without_contacting_host() {
+    let repo = TestRepo::new();
+    let other_repo = TestRepo::new();
+    let home = TestHome::new();
+    let api = TcpListener::bind("127.0.0.1:0").unwrap();
+    api.set_nonblocking(true).unwrap();
+    let api_address = api.local_addr().unwrap();
+    let kubeconfig = home.path().join("kubeconfig");
+    fs::write(
+        &kubeconfig,
+        formatdoc! {"
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - name: retired
+          cluster:
+            server: http://{api_address}
+        contexts:
+        - name: retired-cluster
+          context:
+            cluster: retired
+            user: retired
+        users:
+        - name: retired
+          user: {{}}
+    "},
+    )
+    .unwrap();
+    let mut daemon =
+        TestDaemon::start_with_env(&home, &[("KUBECONFIG", kubeconfig.to_str().unwrap())]);
+    let output = pod_command(&repo, &daemon).arg("list").output().unwrap();
+    assert!(output.status.success());
+
+    let conn = db::open_db(&home.path().join("state/rumpelpod/db.sqlite")).unwrap();
+    let pending = home.path().join("state/rumpelpod/pending-creations");
+    fs::create_dir_all(&pending).unwrap();
+    let mut intents = Vec::new();
+    for (repository, name) in [
+        (&repo, "old-k8s"),
+        (&repo, "keep-k8s"),
+        (&other_repo, "old-k8s"),
+    ] {
+        record_disconnected_pod(repository, &home, name, &retired_cluster());
+        let pod = db::get_pod(&conn, repository.path(), name)
+            .unwrap()
+            .unwrap();
+        let creation = hex::encode(Sha256::digest(pod.token.as_bytes()))[..32].to_string();
+        let path = pending.join(&creation);
+        let intent = json!({
+            "repo_path": repository.path(),
+            "pod_name": name,
+            "host": retired_cluster(),
+            "creation": creation,
+        });
+        let temporary = tempfile::NamedTempFile::new_in(&pending).unwrap();
+        fs::write(temporary.path(), serde_json::to_vec(&intent).unwrap()).unwrap();
+        temporary.persist(&path).unwrap();
+        intents.push(path);
+    }
+
+    // Current generations must remain wanted while their pod records exist.
+    // The test daemon runs creation cleanup every 250 ms.
+    std::thread::sleep(Duration::from_millis(750));
+    for intent in &intents {
+        assert!(
+            intent.exists(),
+            "pending creation disappeared before forget"
+        );
+    }
+    assert_eq!(api.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    let output = pod_command(&repo, &daemon)
+        .args(["delete", "--forget", "old-k8s"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !intents[0].exists(),
+        "forgotten creation remains actionable"
+    );
+    assert!(db::get_pod(&conn, repo.path(), "old-k8s")
+        .unwrap()
+        .is_none());
+    for (repository, name, intent) in [
+        (&repo, "keep-k8s", &intents[1]),
+        (&other_repo, "old-k8s", &intents[2]),
+    ] {
+        assert!(intent.exists(), "forget removed another pod's creation");
+        assert!(db::get_pod(&conn, repository.path(), name)
+            .unwrap()
+            .is_some());
+        // Leave no tracked hosts for startup restoration to contact.
+        let output = pod_command(repository, &daemon)
+            .args(["delete", "--forget", name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!intent.exists());
+    }
+
+    daemon.kill();
+    drop(daemon);
+    let daemon = TestDaemon::start_with_env(&home, &[("KUBECONFIG", kubeconfig.to_str().unwrap())]);
+    let output = pod_command(&repo, &daemon).arg("list").output().unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("old-k8s"));
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(api.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
+#[test]
 fn delete_forget_unmerged_requires_force() {
     let repo = TestRepo::new();
     let home = TestHome::new();
@@ -259,7 +383,7 @@ fn delete_forget_leaves_running_container() {
     let repo = TestRepo::new();
     let home = TestHome::new();
     let executor = ExecutorResources::setup(&home);
-    let daemon = TestDaemon::start(&home);
+    let mut daemon = TestDaemon::start(&home);
     write_test_devcontainer(&repo, "", "");
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
     let output = pod_command(&repo, &daemon)
@@ -296,6 +420,13 @@ fn delete_forget_leaves_running_container() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    daemon.kill();
+    drop(daemon);
+    let daemon = TestDaemon::start(&home);
+    let listed = pod_command(&repo, &daemon)
+        .args(["list", "--sync"])
+        .output()
+        .unwrap();
     let inspected = Command::new("docker")
         .args(["inspect", "--format", "{{.State.Running}}", &id])
         .output()
@@ -312,9 +443,12 @@ fn delete_forget_leaves_running_container() {
     );
     assert!(inspected.status.success());
     assert_eq!(String::from_utf8_lossy(&inspected.stdout).trim(), "true");
-    let output = pod_command(&repo, &daemon).arg("list").output().unwrap();
-    assert!(output.status.success());
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("keep-running"));
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("keep-running"));
 }
 
 #[test]

@@ -11,3 +11,9 @@ tracking refs without requiring host configuration or backend access.
 
 Cover vanished hosts, unmerged commits, batch deletion, and preservation
 of running containers with CLI integration tests.
+
+Disarm pending creation cleanup under the lifecycle lock when
+forgetting, so an interrupted launch cannot delete remote resources
+afterward. Check cleanup records again after locking to reject stale
+directory snapshots. Cover delayed creation and forgetting across daemon
+restarts.
