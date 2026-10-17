@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::cli::DeleteCommand;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient, PodName};
+use crate::daemon::protocol::{Daemon, DaemonClient, PodListMode, PodName};
 use crate::git::get_repo_root;
 
 /// Returns true if the repo_state string indicates the pod has unmerged
@@ -25,7 +25,12 @@ pub fn delete(cmd: &DeleteCommand) -> Result<()> {
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
 
-    let pods = client.list_pods(repo_path.clone(), true, false)?;
+    let mode = if cmd.forget {
+        PodListMode::Offline
+    } else {
+        PodListMode::Sync
+    };
+    let pods = client.list_pods(repo_path.clone(), mode, false)?;
 
     let mut failed = 0u32;
 
@@ -65,8 +70,11 @@ pub fn delete(cmd: &DeleteCommand) -> Result<()> {
                 continue;
             }
         };
-        if let Err(e) = client.delete_pod(pod_name, repo_path.clone(), cmd.wait) {
+        if let Err(e) = client.delete_pod(pod_name, repo_path.clone(), cmd.wait, cmd.forget) {
             eprintln!("failed to delete pod '{name}': {e}");
+            if !cmd.forget {
+                eprintln!("if the host is permanently gone, use --forget to remove local tracking");
+            }
             failed += 1;
         }
     }

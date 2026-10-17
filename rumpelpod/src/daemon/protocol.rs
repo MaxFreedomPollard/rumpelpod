@@ -338,6 +338,7 @@ struct DeletePodRequest {
     pod_name: PodName,
     repo_path: PathBuf,
     wait: bool,
+    forget: bool,
 }
 
 /// Response body for delete_pod endpoint.
@@ -352,11 +353,22 @@ struct DeleteAllPodsResponse {
     deleted: u32,
 }
 
+/// Whether listing may contact pod hosts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum PodListMode {
+    /// Use cached status, querying hosts whose container IDs are not cached yet.
+    Cached,
+    /// Refresh container status from every host.
+    Sync,
+    /// Use only local state, even when a host has never been queried.
+    Offline,
+}
+
 /// Request body for list_pods endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 struct ListPodsRequest {
     repo_path: PathBuf,
-    sync: bool,
+    mode: PodListMode,
     sync_refs: bool,
 }
 
@@ -568,12 +580,24 @@ pub trait Daemon: Send + Sync + 'static {
 
     // DELETE /pod
     // Stops and removes a pod container.  When wait is true, blocks until the
-    // container is fully removed; otherwise returns immediately.
-    fn delete_pod(&self, pod_name: PodName, repo_path: PathBuf, wait: bool) -> Result<()>;
+    // container is fully removed; otherwise returns immediately. Forget only
+    // removes local tracking, so it does not require a working host connection.
+    fn delete_pod(
+        &self,
+        pod_name: PodName,
+        repo_path: PathBuf,
+        wait: bool,
+        forget: bool,
+    ) -> Result<()>;
 
     // GET /pod
     // Lists all pods for a given repository.
-    fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>>;
+    fn list_pods(
+        &self,
+        repo_path: PathBuf,
+        mode: PodListMode,
+        sync_refs: bool,
+    ) -> Result<Vec<PodInfo>>;
 
     // POST /review
     // Temporary: the unpublished VS Code extension still POSTs here.
@@ -882,13 +906,20 @@ impl Daemon for DaemonClient {
         Ok(())
     }
 
-    fn delete_pod(&self, pod_name: PodName, repo_path: PathBuf, wait: bool) -> Result<()> {
+    fn delete_pod(
+        &self,
+        pod_name: PodName,
+        repo_path: PathBuf,
+        wait: bool,
+        forget: bool,
+    ) -> Result<()> {
         let url = self.url.join("/pod")?;
         let description = format!("deleting pod '{}'", pod_name.0);
         let request = DeletePodRequest {
             pod_name,
             repo_path,
             wait,
+            forget,
         };
 
         let response = self
@@ -902,11 +933,16 @@ impl Daemon for DaemonClient {
         Ok(())
     }
 
-    fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>> {
+    fn list_pods(
+        &self,
+        repo_path: PathBuf,
+        mode: PodListMode,
+        sync_refs: bool,
+    ) -> Result<Vec<PodInfo>> {
         let url = self.url.join("/pod")?;
         let request = ListPodsRequest {
             repo_path,
-            sync,
+            mode,
             sync_refs,
         };
 
@@ -1673,7 +1709,12 @@ async fn delete_pod_handler<D: Daemon>(
 ) -> Response {
     let name = request.pod_name.0.clone();
     streaming_result_response(format!("deleting pod '{name}'..."), move || {
-        daemon.delete_pod(request.pod_name, request.repo_path, request.wait)?;
+        daemon.delete_pod(
+            request.pod_name,
+            request.repo_path,
+            request.wait,
+            request.forget,
+        )?;
         Ok(DeletePodResponse { deleted: true })
     })
 }
@@ -1692,7 +1733,7 @@ async fn list_pods_handler<D: Daemon>(
     Json(request): Json<ListPodsRequest>,
 ) -> Response {
     streaming_result_response("listing pods...".into(), move || {
-        let pods = daemon.list_pods(request.repo_path, request.sync, request.sync_refs)?;
+        let pods = daemon.list_pods(request.repo_path, request.mode, request.sync_refs)?;
         Ok(ListPodsResponse { pods })
     })
 }

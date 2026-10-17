@@ -1,0 +1,13 @@
+Allow pod cleanup after a host disappears
+
+Provide delete --forget for pods whose SSH host or Kubernetes cluster no
+longer exists. Keep --force scoped to bypassing the unmerged-commit
+check so transient connection failures do not silently abandon remote
+resources.
+
+Use offline listing for forgetting, since even cached listings can query
+hosts to warm container IDs. Remove local metadata, connections, and Git
+tracking refs without requiring host configuration or backend access.
+
+Cover vanished hosts, unmerged commits, batch deletion, and preservation
+of running containers with CLI integration tests.
