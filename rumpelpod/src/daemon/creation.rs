@@ -135,6 +135,11 @@ impl DaemonServer {
             let Ok(_lease) = lock.lease.clone().try_lock_owned() else {
                 continue;
             };
+            // Cancellation releases startup's lease before delete/forget can
+            // acquire it. Do not start deferred deletion in that gap.
+            if lock.state.lock().unwrap().deleting != 0 {
+                continue;
+            }
             // Forget may have removed the intent since the directory scan.
             // Check under its lease before acting on the stale snapshot.
             if !path.try_exists()? {

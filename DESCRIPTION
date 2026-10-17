@@ -15,5 +15,5 @@ of running containers with CLI integration tests.
 Disarm pending creation cleanup under the lifecycle lock when
 forgetting, so an interrupted launch cannot delete remote resources
 afterward. Check cleanup records again after locking to reject stale
-directory snapshots. Cover delayed creation and forgetting across daemon
-restarts.
+directory snapshots. Defer cleanup during startup cancellation as well.
+Cover delayed creation and forgetting across daemon restarts.
