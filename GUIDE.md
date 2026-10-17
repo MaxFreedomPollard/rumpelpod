@@ -64,6 +64,14 @@ rumpel enter my-pod
 
 Other useful commands: `rumpel list` shows all pods for the current repository, `rumpel delete` removes a pod and its container, and `rumpel prune` deletes all stopped pods for the current repository.
 
+If a pod's host or Kubernetes cluster is permanently gone, use
+`rumpel delete --forget NAME [NAME ...]` to remove its local tracking without
+contacting the host. This removes the pod's metadata and Git tracking refs;
+any containers or other resources that still exist on the host are left
+untouched. Pods with unmerged commits still require confirmation, or
+`--force` when running without a terminal. `--forget` cannot be combined
+with `--wait`, which waits for actual container removal.
+
 ## Container configuration
 
 Rumpelpod consumes `devcontainer.json` following the [Dev Container spec][spec].

@@ -491,6 +491,14 @@ pub struct DeleteCommand {
     /// Delete even if the pod has unmerged commits
     #[arg(long)]
     pub force: bool,
+
+    /// Forget local tracking without contacting the host
+    ///
+    /// Use when a host or cluster is permanently gone. Removes local pod
+    /// metadata and Git tracking refs; any remote resources are left untouched.
+    /// Unmerged commits still require confirmation or --force.
+    #[arg(long, conflicts_with = "wait")]
+    pub forget: bool,
 }
 
 #[derive(Args)]

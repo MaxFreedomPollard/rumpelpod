@@ -14,7 +14,7 @@ use crate::config::{load_json_config, ContainerEngine, Host};
 use crate::daemon;
 use crate::daemon::protocol::{
     ClientContext, ConnectPodRequest, Daemon, DaemonClient, LaunchProgress, LaunchResult,
-    PodLaunchParams, PodName, PreparedPodConnection,
+    PodLaunchParams, PodListMode, PodName, PreparedPodConnection,
 };
 use crate::devcontainer::{DevContainer, GpuRequirement, HostRequirements, SubstitutionContext};
 use crate::git::{get_current_branch, get_git_user_config, get_repo_root};
@@ -305,7 +305,7 @@ pub fn find_local_grok_cli() -> Option<PathBuf> {
 pub fn confirm_pod_creation(pod_name: &str, repo_root: &Path, create: bool) -> Result<()> {
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root.to_path_buf(), true, false)?;
+    let pods = client.list_pods(repo_root.to_path_buf(), PodListMode::Sync, false)?;
     if pods.iter().any(|p| p.name == pod_name) {
         return Ok(());
     }

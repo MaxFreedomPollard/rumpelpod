@@ -42,7 +42,8 @@ use pod_connection::{PodConnection, PodConnectionStatus, PodEndpoint, PodRepairB
 use protocol::{
     AddForwardedPortRequest, ClaudeConnection, ClientContext, ConnectPodRequest, ContainerId,
     Daemon, DaemonEvent, EnsureClaudeConfigRequest, EnsurePiConfigRequest, ForkPodRequest, Image,
-    LaunchResult, PodInfo, PodLaunchParams, PodName, PodStatus, PortInfo, PreparedPodConnection,
+    LaunchResult, PodInfo, PodLaunchParams, PodListMode, PodName, PodStatus, PortInfo,
+    PreparedPodConnection,
 };
 
 use crate::pod::types::{ClaudeState, CodexState, GitSetupParams};
@@ -6000,9 +6001,36 @@ impl Daemon for DaemonServer {
         Ok(())
     }
 
-    fn delete_pod(&self, pod_name: PodName, repo_path: PathBuf, wait: bool) -> Result<()> {
+    fn delete_pod(
+        &self,
+        pod_name: PodName,
+        repo_path: PathBuf,
+        wait: bool,
+        forget: bool,
+    ) -> Result<()> {
+        if forget && wait {
+            return Err(anyhow::anyhow!("--forget cannot be combined with --wait"));
+        }
         let lifecycle_lock = self.lifecycle_locks.for_pod(&repo_path, &pod_name.0);
         let lifecycle_guard = lifecycle_lock.acquire_for_delete();
+        if forget {
+            creation::forget(&repo_path, &pod_name.0)?;
+            // Do not resolve the stored host: its kubeconfig or SSH setup may
+            // have disappeared along with the infrastructure being forgotten.
+            self.connections.remove_pod(&repo_path, &pod_name.0);
+            self.cleanup_codex_runtime(&repo_path, &pod_name.0);
+            self.container_ids
+                .lock()
+                .unwrap()
+                .ids
+                .remove(&(repo_path.clone(), pod_name.0.clone()));
+            cleanup_pod_refs(&repo_path, &pod_name);
+            let conn = self.db.lock().unwrap();
+            db::delete_pod(&conn, &repo_path, &pod_name.0)?;
+            drop(conn);
+            self.emit_status_changed(&repo_path, &pod_name.0);
+            return Ok(());
+        }
         self.delete_pod_impl(
             pod_name,
             repo_path,
@@ -6012,7 +6040,20 @@ impl Daemon for DaemonServer {
         )
     }
 
-    fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>> {
+    fn list_pods(
+        &self,
+        repo_path: PathBuf,
+        mode: PodListMode,
+        sync_refs: bool,
+    ) -> Result<Vec<PodInfo>> {
+        let (sync, offline) = match mode {
+            PodListMode::Cached => (false, false),
+            PodListMode::Sync => (true, false),
+            PodListMode::Offline => (false, true),
+        };
+        if offline && sync_refs {
+            return Err(anyhow::anyhow!("offline listing cannot sync Git refs"));
+        }
         let conn = self.db.lock().unwrap();
         let db_pods = db::list_pods(&conn, &repo_path)?;
         drop(conn);
@@ -6023,7 +6064,7 @@ impl Daemon for DaemonServer {
 
         let mut status_maps: HashMap<String, Option<HashMap<String, PodBackendInfo>>> =
             HashMap::new();
-        {
+        if !offline {
             // Local Docker and local Podman have separate stores, so
             // the stored host JSON is part of the key.
             //

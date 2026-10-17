@@ -18,6 +18,7 @@ use indoc::{formatdoc, indoc};
 use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
+use serde_json::Value;
 use tempfile::NamedTempFile;
 
 use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
@@ -927,6 +928,117 @@ fn image_commands_sigint_reaches_child() {
             "image {operation} left its child {child} running after Ctrl-C"
         );
     }
+}
+
+#[test]
+fn delete_forget_cancels_startup_without_cleaning_late_creation() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let real_docker_path = real_docker.display();
+    let markers = repo.path().display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" create "*)
+                printf '%s\0' "$@" > '{markers}/accepted-args'
+                echo $$ > '{markers}/create-parent'
+                exec sleep 600
+                ;;
+        esac
+        exec '{real_docker_path}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "VOLUME /forgotten-volume", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "forgotten-create",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("creating container...");
+    let parent = wait_for_pid(&repo.path().join("create-parent"));
+    let pending_directory = home.path().join("state/rumpelpod/pending-creations");
+    let current_intent = fs::read_dir(&pending_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // The blocked launch holds the lifecycle lease, so the cleaner cannot
+    // act on this older incarnation before forget has a chance to disarm it.
+    let mut older: Value = serde_json::from_slice(&fs::read(current_intent).unwrap()).unwrap();
+    let old_creation = "00000000000000000000000000000000";
+    older["creation"] = old_creation.into();
+    let temporary = NamedTempFile::new_in(&pending_directory).unwrap();
+    fs::write(temporary.path(), serde_json::to_vec(&older).unwrap()).unwrap();
+    temporary
+        .persist(pending_directory.join(old_creation))
+        .unwrap();
+    assert_eq!(fs::read_dir(&pending_directory).unwrap().count(), 2);
+
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--forget",
+        "forgotten-create",
+    ]))
+    .success(RECOVERY_TIMEOUT, "forget an accepted but unfinished create");
+    launch.failure(RECOVERY_TIMEOUT, "forgotten startup must finish");
+    assert_process_exited(parent);
+    assert_eq!(
+        fs::read_dir(&pending_directory).unwrap().count(),
+        0,
+        "forget must disarm durable cleanup before returning"
+    );
+    daemon.kill();
+    drop(daemon);
+
+    // Backend acceptance may outlive both the cancelled launch and its daemon.
+    // Forget must leave this late resource alone, even across a restart.
+    let bytes = fs::read(repo.path().join("accepted-args")).unwrap();
+    let arguments: Vec<_> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| std::str::from_utf8(arg).unwrap())
+        .collect();
+    let container = TestProcess::spawn(Command::new(&real_docker).args(arguments)).success(
+        RECOVERY_TIMEOUT,
+        "complete accepted creation after forgetting",
+    );
+    let container = container.trim();
+    let daemon = TestDaemon::start(&home);
+    let listed = TestProcess::spawn(pod_command(&repo, &daemon).args(["list", "--sync"]))
+        .success(RECOVERY_TIMEOUT, "list after restarting the daemon");
+    assert!(!listed.contains("forgotten-create"));
+    let remaining = TestProcess::spawn(Command::new(&real_docker).args([
+        "ps",
+        "-aq",
+        "--filter",
+        &format!("id={container}"),
+    ]))
+    .success(RECOVERY_TIMEOUT, "inspect late forgotten creation");
+    assert!(
+        !remaining.trim().is_empty(),
+        "restart deleted the forgotten creation"
+    );
+    TestProcess::spawn(Command::new(&real_docker).args(["rm", "-fv", container])).success(
+        RECOVERY_TIMEOUT,
+        "clean up the intentionally forgotten container",
+    );
 }
 
 #[test]

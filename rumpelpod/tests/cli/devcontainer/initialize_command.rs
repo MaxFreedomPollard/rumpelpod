@@ -8,7 +8,9 @@ use std::fs;
 use std::process::Command;
 
 use rumpelpod::config::{ContainerEngine, Host};
-use rumpelpod::daemon::protocol::{Daemon, DaemonClient, LaunchProgress, PodLaunchParams, PodName};
+use rumpelpod::daemon::protocol::{
+    Daemon, DaemonClient, LaunchProgress, PodLaunchParams, PodListMode, PodName,
+};
 use rumpelpod::CommandExt;
 use serde_json::json;
 
@@ -96,7 +98,7 @@ fn initialize_command_runs_before_config_reload_when_backend_pod_is_gone() {
 
     let client = DaemonClient::new_unix(&daemon.socket_path);
     let container_id = client
-        .list_pods(repo.path().to_path_buf(), false, false)
+        .list_pods(repo.path().to_path_buf(), PodListMode::Cached, false)
         .expect("list created pod")
         .into_iter()
         .find(|pod| pod.name == pod_name)
