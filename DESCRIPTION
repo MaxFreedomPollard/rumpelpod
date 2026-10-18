@@ -1,0 +1,13 @@
+Guard Codex sessions against oversized catalogs
+
+A simulated app-server cannot establish that real Codex emits a frame
+large enough to break the remote session. Generate a local marketplace
+with a 17 MiB plugin description and exercise the installed Codex binary
+through a real pod and the remote TUI without inference or a live
+catalog.
+
+Verify the returned catalog exceeds 16 MiB, preserves its description,
+and allows another RPC on the same connection. Require the TUI to
+display the plugin through both production proxies. Restoring the
+daemon's old 16 MiB frame limit reproduces the reconnect loop and fails
+this test.
