@@ -37,9 +37,9 @@ fn codex_permissions_default_bypass_overrides_config() {
     configure_read_only(&home);
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     let contents = session.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    assert!(contents.contains("Full Access"), "{contents}");
     session.send("Run `printf %x 3735928559`.");
     session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }
@@ -57,7 +57,7 @@ fn codex_permissions_cli_opt_out_preserves_config() {
         &[NO_BYPASS],
         &[],
     );
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     session.send("/status");
     session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }
@@ -73,7 +73,7 @@ fn codex_permissions_config_opt_out_preserves_config() {
         .expect("write disabled bypass config");
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     session.send("/status");
     session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }
@@ -90,7 +90,7 @@ fn codex_permissions_cli_opt_out_allows_permission_flags() {
         &[NO_BYPASS],
         &["--sandbox", "read-only", "--ask-for-approval", "on-request"],
     );
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     session.send("/status");
     session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }
@@ -101,12 +101,13 @@ fn codex_permissions_new_threads_keep_default_bypass() {
     configure_read_only(&home);
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for_with_timeout("Paris", Duration::from_secs(30));
     session.send("/new");
-    // Codex prints the prior thread's usage after configuring the new thread.
-    session.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
+    // The full-screen UI replaces the previous transcript when the new thread
+    // is configured. Wait for that replacement before inspecting its settings.
+    session.wait_for_absent_with_timeout("Paris", Duration::from_secs(30));
     session.send("/status");
     session.wait_for_with_timeout("Full Access", Duration::from_secs(30));
 }
@@ -116,15 +117,20 @@ fn codex_permissions_picker_survives_new_thread() {
     let (home, repo, _executor, daemon) = setup_codex_test_repo();
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for_with_timeout("Paris", Duration::from_secs(30));
     session.send("/permissions");
     session.wait_for_with_timeout("4. Read Only", Duration::from_secs(30));
     session.write_raw(b"4\r");
-    session.wait_for_with_timeout("Permissions updated to Read Only", Duration::from_secs(30));
+    session.wait_for_with_timeout(
+        "Permission selection requested: Read Only",
+        Duration::from_secs(30),
+    );
+    session.send("/status");
+    session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
     session.send("/new");
-    session.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
+    session.wait_for_absent_with_timeout("Paris", Duration::from_secs(30));
     session.send("/status");
     session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }
@@ -136,7 +142,7 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     write_test_devcontainer(&repo, "RUN apk add --no-cache procps", "");
 
     let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    first.dismiss_dialogs();
+    first.wait_for_ready();
     first.send("What is the capital of France? Reply with just the city name, nothing else.");
     first.wait_for_with_timeout("Paris", Duration::from_secs(30));
     let original = app_server_command(&repo, &daemon);
@@ -155,8 +161,8 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         &[],
     );
     second.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    let contents = second.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    second.send("/status");
+    second.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     assert_eq!(app_server_command(&repo, &daemon), original);
     second.send("/exit");
     second.wait_for_exit();
@@ -168,7 +174,7 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         .expect("kill only this test's app-server");
 
     // The daemon and its cached proxy survive this failure. The replacement
-    // server must receive the current opt-out, while the saved thread stays YOLO.
+    // server must receive the current opt-out, while the saved thread keeps full access.
     let mut third = CodexSession::spawn_named_with_rumpel_args(
         &repo,
         &daemon,
@@ -178,14 +184,14 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         &[],
     );
     third.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    let contents = third.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    third.send("/status");
+    third.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     let replacement = app_server_command(&repo, &daemon);
     assert_ne!(replacement.split_whitespace().next(), Some(pid));
     assert!(!replacement.contains(" -c "), "{replacement}");
 
     third.send("/new");
-    third.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
+    third.wait_for_absent_with_timeout("Paris", Duration::from_secs(30));
     third.send("/status");
     third.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }
@@ -200,7 +206,7 @@ fn codex_permissions_survive_pod_restart() {
     write_test_devcontainer(&repo, "RUN apk add --no-cache procps", "");
 
     let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    first.dismiss_dialogs();
+    first.wait_for_ready();
     first.send("What is the capital of France? Reply with just the city name, nothing else.");
     first.wait_for_with_timeout("Paris", Duration::from_secs(30));
     first.send("/exit");
@@ -212,8 +218,8 @@ fn codex_permissions_survive_pod_restart() {
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    let contents = resumed.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    resumed.send("/status");
+    resumed.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     let command = app_server_command(&repo, &daemon);
     assert!(command.contains("approval_policy=\"never\""), "{command}");
     assert!(

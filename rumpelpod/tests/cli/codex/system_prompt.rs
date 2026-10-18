@@ -12,7 +12,7 @@ fn codex_system_prompt_describes_remotes() {
     let (_home, repo, _executor, daemon) = setup_codex_test_repo();
 
     let mut session = CodexSession::spawn(&repo, &daemon, _home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
 
     // "all uppercase" prevents a false positive: "rumpelpod" appears
     // in the Codex warning about the temp home dir path.
@@ -25,7 +25,7 @@ fn codex_system_prompt_describes_description_file() {
     let (_home, repo, _executor, daemon) = setup_codex_test_repo();
 
     let mut session = CodexSession::spawn(&repo, &daemon, _home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
 
     session.send("In which file should you put the merge commit message? One word only.");
     session.wait_for("DESCRIPTION");

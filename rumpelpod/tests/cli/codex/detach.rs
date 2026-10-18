@@ -3,8 +3,8 @@
 
 //! Test detach (Ctrl-a d) and reattach for the host-side codex screen
 //! session: type into the prompt, detach, reattach, and verify the
-//! screen replay restores the pending input immediately (no welcome
-//! dialog, no need to re-dismiss model selection).
+//! screen replay restores the pending input immediately without starting
+//! another frontend or waiting for initialization again.
 
 use super::common::{setup_codex_test_repo, CodexSession};
 
@@ -18,7 +18,7 @@ fn codex_detach_reattach() {
     // -- First session: type a marker, then detach ----------------------
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     let replay_marker = "warm-reattach-replay-marker";
     session.write_raw(replay_marker.as_bytes());
     session.wait_for(replay_marker);
@@ -39,7 +39,7 @@ fn codex_detach_reattach() {
     // The daemon-managed screen session keeps the codex TUI process
     // alive between invocations.  Reattaching replays the vt100 screen
     // buffer so the previous question and answer are visible
-    // immediately, with no dismiss_dialogs() needed.
+    // immediately, with no wait_for_ready() needed.
 
     let mut session2 = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     session2.wait_for(replay_marker);

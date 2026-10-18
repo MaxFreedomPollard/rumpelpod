@@ -65,7 +65,7 @@ fn start_codex_and_read_port(
     pod_name: &str,
 ) -> u16 {
     let mut session = CodexSession::spawn_named(repo, daemon, home, pod_name, &[]);
-    session.dismiss_dialogs_with_timeout(Duration::from_secs(120));
+    session.wait_for_ready_with_timeout(Duration::from_secs(120));
 
     let output = pod_command(repo, daemon)
         .arg("enter")

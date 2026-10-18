@@ -261,27 +261,19 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.219
 USER root
 
 # Keep the Codex used by CI outside the interactive PATH so developers can use
-# a different release without changing the test baseline. Download both
-# release executables because code mode resolves its host next to the CLI.
-ARG CODEX_VERSION=0.154.0
+# a different release without changing the test baseline. Preserve the package
+# layout so Codex can discover its manifest and bundled tools.
+ARG CODEX_VERSION=0.163.0
 ENV RUMPELPOD_TEST_CODEX_BIN_DIR=/opt/rumpelpod-test-codex/bin
 RUN case "$(uname -m)" in \
         x86_64) CODEX_TARGET=x86_64-unknown-linux-musl ;; \
         aarch64) CODEX_TARGET=aarch64-unknown-linux-musl ;; \
         *) echo "unsupported Codex architecture: $(uname -m)" >&2; exit 1 ;; \
     esac && \
-    mkdir -p "${RUMPELPOD_TEST_CODEX_BIN_DIR}" && \
-    for binary in codex codex-code-mode-host; do \
-        curl -fsSL \
-            "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${binary}-${CODEX_TARGET}.tar.gz" \
-        | tar xz -C "${RUMPELPOD_TEST_CODEX_BIN_DIR}" && \
-        mv \
-            "${RUMPELPOD_TEST_CODEX_BIN_DIR}/${binary}-${CODEX_TARGET}" \
-            "${RUMPELPOD_TEST_CODEX_BIN_DIR}/${binary}"; \
-    done && \
-    chmod +x \
-        "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex" \
-        "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex-code-mode-host" && \
+    mkdir -p /opt/rumpelpod-test-codex && \
+    curl -fsSL \
+        "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-package-${CODEX_TARGET}.tar.gz" \
+        | tar xz -C /opt/rumpelpod-test-codex && \
     "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex" --version
 
 # Install the xAI Grok Build coding agent: a single statically-linked binary served

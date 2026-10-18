@@ -532,6 +532,12 @@ The `claude` object configures the `rumpel claude` command.
 
 The `codex` object configures the `rumpel codex` command.
 
+Pods receive the complete Codex release package matching the version of the
+local CLI, including its manifest and bundled tools. Rumpelpod manages the
+app-server process: it survives client disconnects and starts again on the next
+connection if it exits or the pod restarts. It does not install a native Codex
+daemon service or automatically upgrade Codex inside the pod.
+
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `dangerouslyBypassApprovalsAndSandbox` | bool | `true` | sets the Codex app-server's startup defaults to bypass approvals and sandboxing. The pod already provides an isolated environment, so Codex does not need its own sandbox on top. |

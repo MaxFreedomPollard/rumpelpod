@@ -74,7 +74,6 @@ pub fn setup_codex_test_repo() -> (TestHome, TestRepo, ExecutorResources, TestDa
 const PTY_ROWS: u16 = 500;
 const PTY_COLS: u16 = 80;
 const SCREEN_DUMP_INTERVAL: Duration = Duration::from_secs(5);
-const WELCOME_MESSAGE: &str = "To get started, describe a task";
 
 /// An interactive Codex session running via `rumpel codex`.
 pub struct CodexSession {
@@ -229,6 +228,21 @@ impl CodexSession {
     /// Restart tests use this so connection failures surface before
     /// xtest kills the whole test process.
     pub fn wait_for_with_timeout(&mut self, needle: &str, timeout: Duration) -> String {
+        self.wait_for_screen(needle, timeout, |contents| contents.contains(needle))
+    }
+
+    pub fn wait_for_absent_with_timeout(&mut self, needle: &str, timeout: Duration) {
+        self.wait_for_screen(&format!("{needle:?} to disappear"), timeout, |contents| {
+            !contents.contains(needle)
+        });
+    }
+
+    fn wait_for_screen(
+        &mut self,
+        needle: &str,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let deadline = Instant::now() + timeout;
         let mut last_dump = Instant::now();
 
@@ -255,7 +269,7 @@ impl CodexSession {
                         self.parser.process(&more);
                     }
                     let contents = self.parser.screen().contents();
-                    if contents.contains(needle) {
+                    if matches(&contents) {
                         return contents;
                     }
                     if last_dump.elapsed() >= SCREEN_DUMP_INTERVAL {
@@ -287,52 +301,38 @@ impl CodexSession {
         }
     }
 
-    /// Dismiss startup dialogs and wait for a fresh conversation to accept input.
-    pub fn dismiss_dialogs(&mut self) {
-        loop {
-            self.wait_for("\u{203a}");
-
-            while let Ok(bytes) = self.rx.try_recv() {
-                self.raw_log.extend_from_slice(&bytes);
-                self.parser.process(&bytes);
-            }
-
-            if !self.parser.screen().alternate_screen() {
-                break;
-            }
-
-            self.writer.write_all(b"\r").expect("write Enter");
-            self.writer.flush().expect("flush");
-        }
-
-        // The startup composer accepts edits but discards Enter. The welcome
-        // instructions appear after the remote thread is ready for submissions.
-        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
-            self.wait_for(WELCOME_MESSAGE);
-        }
+    /// Wait until the default full-screen UI can execute a local command.
+    pub fn wait_for_ready(&mut self) {
+        self.wait_for_ready_with_timeout(Duration::from_secs(60));
     }
 
     /// Lifecycle tests need a bounded startup wait because stale
     /// remote state can close the TUI before it reaches a prompt.
-    pub fn dismiss_dialogs_with_timeout(&mut self, timeout: Duration) {
+    pub fn wait_for_ready_with_timeout(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        self.wait_for_with_timeout("Ask Codex to do anything", timeout);
+        // A rendered /status response proves readiness without relying on the
+        // screen buffer mode or welcome animation, and exposes permissions.
+        self.send_with_timeout(
+            "/status",
+            deadline.saturating_duration_since(Instant::now()),
+        );
         loop {
-            self.wait_for_with_timeout("\u{203a}", timeout);
-
-            while let Ok(bytes) = self.rx.try_recv() {
-                self.raw_log.extend_from_slice(&bytes);
-                self.parser.process(&bytes);
+            let contents = self.wait_for_screen(
+                "startup status response",
+                deadline.saturating_duration_since(Instant::now()),
+                |contents| {
+                    contents.contains("Permissions:")
+                        || (contents.contains("\u{203a} /status")
+                            && !contents.contains("Waiting for startup"))
+                },
+            );
+            if contents.contains("Permissions:") {
+                return;
             }
-
-            if !self.parser.screen().alternate_screen() {
-                break;
-            }
-
-            self.writer.write_all(b"\r").expect("write Enter");
-            self.writer.flush().expect("flush");
-        }
-
-        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
-            self.wait_for_with_timeout(WELCOME_MESSAGE, timeout);
+            // Falling back from resume to a fresh thread cancels a queued
+            // submission but keeps its text. Confirm that retained command.
+            self.write_raw(b"\r");
         }
     }
 
