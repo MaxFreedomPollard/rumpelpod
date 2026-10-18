@@ -29,7 +29,6 @@ sha2 = ">= 0"
 hex = ">= 0"
 serde = { version = ">= 0", features = ["derive"] }
 serde_json = { version = ">= 0", features = ["preserve_order"] }
-semver = ">= 0"
 json5 = ">= 0"
 notify = ">= 0"
 tokio = { version = ">= 0", features = ["full"] }

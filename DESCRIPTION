@@ -1,0 +1,11 @@
+Keep Codex package discovery working in pods
+
+Codex needs its package manifest and bundled resources to recognize a
+complete installation. Preserve the release package layout in pods and
+keep the existing app-server launcher responsible for its lifetime.
+
+Pin the development and integration test package to Codex 0.163.0 and
+regenerate OpenAI responses so offline tests exercise the updated CLI.
+Keep the tests on Codex's default full-screen UI, synchronizing with its
+startup and thread transitions instead of assuming inline terminal
+output.
