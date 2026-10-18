@@ -32,6 +32,12 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite;
 
+use crate::codex::{codex_websocket_config, CODEX_MAX_MESSAGE_SIZE};
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+mod tests;
+
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap how much app-server stderr we keep for diagnostics so a chatty
 /// process cannot balloon memory while we wait.
@@ -62,7 +68,9 @@ pub async fn codex_ws_handler(
     State(state): State<super::server::PodServerState>,
     Query(query): Query<CodexQuery>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_codex_proxy(socket, state, query.bypass))
+    ws.max_message_size(CODEX_MAX_MESSAGE_SIZE)
+        .max_frame_size(CODEX_MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_codex_proxy(socket, state, query.bypass))
 }
 
 async fn handle_codex_proxy(
@@ -318,9 +326,13 @@ async fn health_check(port: u16) -> bool {
 /// Connect to the app-server and bidirectionally forward WebSocket frames.
 async fn proxy_to_app_server(client_ws: WebSocket, port: u16, bypass: bool) -> Result<()> {
     let ws_url = app_server_ws_url(port);
-    let (server_ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .context("connecting to codex app-server WebSocket")?;
+    let (server_ws, _) = tokio_tungstenite::connect_async_with_config(
+        &ws_url,
+        Some(codex_websocket_config()),
+        false,
+    )
+    .await
+    .context("connecting to codex app-server WebSocket")?;
 
     let (mut server_write, mut server_read) = server_ws.split();
     let (mut client_write, mut client_read) = client_ws.split();
@@ -330,25 +342,23 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16, bypass: bool) -> R
         tokio::select! {
             msg = client_read.next() => {
                 match msg {
-                    Some(Ok(msg)) => {
+                    Some(msg) => {
+                        let msg = msg.context("reading WebSocket from daemon codex proxy")?;
                         let msg = use_app_server_permission_defaults(msg, &mut use_server_defaults);
                         let tung_msg = axum_to_tungstenite(msg);
-                        if server_write.send(tung_msg).await.is_err() {
-                            break;
-                        }
+                        server_write.send(tung_msg).await.context("forwarding WebSocket to codex app-server")?;
                     }
-                    Some(Err(_)) | None => break,
+                    None => break,
                 }
             }
             msg = server_read.next() => {
                 match msg {
-                    Some(Ok(msg)) => {
+                    Some(msg) => {
+                        let msg = msg.context("reading WebSocket from codex app-server")?;
                         let axum_msg = tungstenite_to_axum(msg);
-                        if client_write.send(axum_msg).await.is_err() {
-                            break;
-                        }
+                        client_write.send(axum_msg).await.context("forwarding WebSocket to daemon codex proxy")?;
                     }
-                    Some(Err(_)) | None => break,
+                    None => break,
                 }
             }
         }
@@ -468,9 +478,13 @@ async fn run_codex_monitor(
     port: u16,
 ) -> Result<()> {
     let ws_url = app_server_ws_url(port);
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .context("connecting to codex app-server")?;
+    let (mut ws, _) = tokio_tungstenite::connect_async_with_config(
+        &ws_url,
+        Some(codex_websocket_config()),
+        false,
+    )
+    .await
+    .context("connecting to codex app-server")?;
 
     // -- Initialize handshake --
     // Opt out of high-volume notifications we do not need for state

@@ -43,6 +43,7 @@ use crate::pty_attach;
 use crate::pty_session::{serve_ws_session_with_params, SessionSpec};
 
 const CODEX_PROXY_TOKEN_ENV: &str = "RUMPELPOD_CODEX_PROXY_TOKEN";
+pub(crate) const CODEX_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 type WsServerRequest = tungstenite::handshake::server::Request;
 type WsServerResponse = tungstenite::handshake::server::Response;
 type WsServerErrorResponse = tungstenite::handshake::server::ErrorResponse;
@@ -316,6 +317,15 @@ fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
 // WebSocket proxy (runs inside the daemon process)
 // ---------------------------------------------------------------------------
 
+pub(crate) fn codex_websocket_config() -> tungstenite::protocol::WebSocketConfig {
+    // Plugin catalogs can exceed Tungstenite's default 16 MiB frame limit.
+    // Codex sends them as single frames, so both proxy hops must accept a
+    // whole message in one frame while retaining the 64 MiB message bound.
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(CODEX_MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(CODEX_MAX_MESSAGE_SIZE))
+}
+
 /// Accept loop for the daemon-managed codex WebSocket proxy.
 ///
 /// Each incoming connection from the local codex TUI is forwarded to
@@ -368,10 +378,13 @@ async fn proxy_connection(
     bypass: bool,
 ) -> Result<()> {
     let expected_auth = format!("Bearer {client_token}");
-    let client_ws =
-        tokio_tungstenite::accept_hdr_async(stream, CodexProxyAuthCallback { expected_auth })
-            .await
-            .context("accepting WebSocket from codex TUI")?;
+    let client_ws = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        CodexProxyAuthCallback { expected_auth },
+        Some(codex_websocket_config()),
+    )
+    .await
+    .context("accepting WebSocket from codex TUI")?;
 
     // The pod server may not be ready yet (e.g. container-serve is
     // still starting). Retry the upstream connection briefly so a
@@ -379,7 +392,13 @@ async fn proxy_connection(
     let mut server_ws = None;
     for _ in 0..50 {
         let request = build_pod_ws_request(container_url, container_token, bypass)?;
-        match tokio_tungstenite::connect_async(request).await {
+        match tokio_tungstenite::connect_async_with_config(
+            request,
+            Some(codex_websocket_config()),
+            false,
+        )
+        .await
+        {
             Ok((ws, _)) => {
                 server_ws = Some(ws);
                 break;
@@ -399,22 +418,20 @@ async fn proxy_connection(
         tokio::select! {
             msg = client_read.next() => {
                 match msg {
-                    Some(Ok(msg)) => {
-                        if server_write.send(msg).await.is_err() {
-                            break;
-                        }
+                    Some(msg) => {
+                        let msg = msg.context("reading WebSocket from codex TUI")?;
+                        server_write.send(msg).await.context("forwarding WebSocket to pod /codex")?;
                     }
-                    Some(Err(_)) | None => break,
+                    None => break,
                 }
             }
             msg = server_read.next() => {
                 match msg {
-                    Some(Ok(msg)) => {
-                        if client_write.send(msg).await.is_err() {
-                            break;
-                        }
+                    Some(msg) => {
+                        let msg = msg.context("reading WebSocket from pod /codex")?;
+                        client_write.send(msg).await.context("forwarding WebSocket to codex TUI")?;
                     }
-                    Some(Err(_)) | None => break,
+                    None => break,
                 }
             }
         }
