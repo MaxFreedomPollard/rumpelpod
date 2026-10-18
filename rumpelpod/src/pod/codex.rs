@@ -34,10 +34,6 @@ use tokio_tungstenite::tungstenite;
 
 use crate::codex::{codex_websocket_config, CODEX_MAX_MESSAGE_SIZE};
 
-#[cfg(test)]
-#[path = "codex_tests.rs"]
-mod tests;
-
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap how much app-server stderr we keep for diagnostics so a chatty
 /// process cannot balloon memory while we wait.

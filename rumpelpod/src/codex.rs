@@ -43,7 +43,7 @@ use crate::pty_attach;
 use crate::pty_session::{serve_ws_session_with_params, SessionSpec};
 
 const CODEX_PROXY_TOKEN_ENV: &str = "RUMPELPOD_CODEX_PROXY_TOKEN";
-pub(crate) const CODEX_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const CODEX_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 type WsServerRequest = tungstenite::handshake::server::Request;
 type WsServerResponse = tungstenite::handshake::server::Response;
 type WsServerErrorResponse = tungstenite::handshake::server::ErrorResponse;
@@ -318,9 +318,9 @@ fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn codex_websocket_config() -> tungstenite::protocol::WebSocketConfig {
-    // Plugin catalogs can exceed Tungstenite's default 16 MiB frame limit.
-    // Codex sends them as single frames, so both proxy hops must accept a
-    // whole message in one frame while retaining the 64 MiB message bound.
+    // Codex's remote client accepts 128 MiB frames and messages. Plugin
+    // catalogs arrive as single frames, so either proxy imposing a smaller
+    // limit can trigger a reconnect loop.
     tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(CODEX_MAX_MESSAGE_SIZE))
         .max_frame_size(Some(CODEX_MAX_MESSAGE_SIZE))
