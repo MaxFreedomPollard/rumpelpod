@@ -337,8 +337,10 @@ pub fn run_container_server(
                     &setup_progress_tx,
                     &slow_tx,
                 );
-                block_on(super::codex::restore_daemon(&state, &repo_path))
-                    .expect("restoring native Codex daemon failed");
+                // Shell access must remain available to repair a broken Codex config.
+                if let Err(error) = block_on(super::codex::restore_daemon(&state, &repo_path)) {
+                    eprintln!("codex: failed to restore native daemon: {error:#}");
+                }
                 let _ = setup_progress_tx.send("setup complete.".to_string());
                 let _ = setup_done_tx.send(true);
             }));

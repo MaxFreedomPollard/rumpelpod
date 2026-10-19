@@ -11,6 +11,7 @@ defaults and retain the pod's credentials and config on reconnect. Keep
 native lifecycle and state handling inside the pod server, with the
 existing host proxy, credential upload and state-transfer protocol. Old
 pods can retain their manual app server without host-side special cases.
+Codex startup failures leave shell access available for repairs.
 
 Provide procps where native process management needs it. Exclude runtime
 artifacts from snapshots and reset mobile identity only when forking,

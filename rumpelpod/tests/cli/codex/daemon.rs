@@ -73,6 +73,61 @@ fn codex_daemon_is_not_activated_by_installation() {
 }
 
 #[test]
+fn codex_failed_restart_keeps_pod_accessible() {
+    if !executor_supports_stop() {
+        return;
+    }
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    first.wait_for_ready();
+    first.send("/exit");
+    first.wait_for_exit();
+
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            r#"printf '{' > "$HOME/.codex/app-server-daemon/settings.json""#,
+        ])
+        .success()
+        .expect("make native daemon settings invalid before restarting the pod");
+    pod_command(&repo, &daemon)
+        .args(["stop", "--wait", "test"])
+        .success()
+        .expect("stop the activated pod");
+
+    let settings = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "cat \"$HOME/.codex/app-server-daemon/settings.json\"",
+        ])
+        .success()
+        .expect("enter must not depend on successful Codex startup");
+    assert_eq!(settings, b"{");
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "rm \"$HOME/.codex/app-server-daemon/settings.json\"",
+        ])
+        .success()
+        .expect("restore native defaults through the ordinary shell path");
+
+    let mut recovered = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    recovered.wait_for_ready();
+}
+
+#[test]
 fn codex_native_commands_manage_the_frontends_daemon() {
     let (home, repo, _executor, daemon) = setup_codex_test_repo();
     let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);

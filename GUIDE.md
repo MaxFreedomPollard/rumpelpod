@@ -545,7 +545,7 @@ lifecycle. Both implementations expose the same interface to the host daemon.
 After activation, the daemon survives TUI disconnects. Rumpelpod starts it again
 when a frontend needs it or when Rumpelpod starts the existing pod. This uses the
 existing container server setup, without changing the container's entrypoint.
-A new, recreated, or forked pod needs its own `rumpel codex` invocation to activate
+A new or forked pod needs its own `rumpel codex` invocation to activate
 this startup behavior.
 
 Use native Codex commands inside the pod to manage the same daemon, for example:
@@ -561,7 +561,7 @@ Remote control requires Codex's ChatGPT login and the corresponding experimental
 mobile access. Pairing and remote-control settings belong to Codex; Rumpelpod
 adds no separate pairing command or remote-control flag. Forks keep conversations
 and login credentials but get a new installation identity with remote control
-disabled; pair the fork separately. Recreating the same pod preserves its identity.
+disabled; pair the fork separately.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|

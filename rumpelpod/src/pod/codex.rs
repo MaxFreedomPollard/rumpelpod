@@ -32,7 +32,7 @@ use super::server::PodServerState;
 use super::types::CodexState;
 
 // Native startup may wait for another lifecycle operation's lock, including a
-// graceful restart. Do not impose the old raw server's short health deadline.
+// graceful restart.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(120);
 // Keep activation outside agent snapshots: installing Codex or copying another
 // pod's history must not opt a pod into running a background daemon.
@@ -42,7 +42,7 @@ const DAEMON_ENABLED_FILE: &str = "/opt/rumpelpod/codex-daemon-enabled";
 // recreation so native config edits are not replaced by launch defaults.
 const CONFIG_INITIALIZED_FILE: &str = ".codex/.rumpelpod-config-initialized";
 
-/// The rendezvous socket survives native restarts and package updates.
+/// The socket path remains stable across native restarts and package updates.
 pub type CodexAppServer = Arc<Mutex<Option<PathBuf>>>;
 
 pub fn new_codex_app_server() -> CodexAppServer {
