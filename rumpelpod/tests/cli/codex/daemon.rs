@@ -92,6 +92,36 @@ fn codex_first_use_requires_credentials() {
 }
 
 #[test]
+fn codex_daemon_reconnects_without_host_credentials() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    first.wait_for_ready();
+    first.send("/exit");
+    first.wait_for_exit();
+
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "/opt/rumpelpod/bin/codex",
+            "app-server",
+            "daemon",
+            "stop",
+        ])
+        .success()
+        .expect("stop the daemon before removing the host login");
+    // Let the monitor observe shutdown so live state cannot bypass the
+    // credential upload when the next frontend is created.
+    std::thread::sleep(Duration::from_secs(3));
+    fs::remove_file(home.path().join(".codex/auth.json"))
+        .expect("remove host credentials before reconnecting to the pod-owned login");
+
+    let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    resumed.wait_for_ready();
+}
+
+#[test]
 fn codex_failed_restart_keeps_pod_accessible() {
     if !executor_supports_stop() {
         return;
@@ -238,11 +268,6 @@ fn codex_native_commands_manage_the_frontends_daemon() {
         .expect("probe stopped native daemon");
     let stopped: serde_json::Value = serde_json::from_slice(&output).expect("native stop JSON");
     assert_eq!(stopped["status"], "notRunning", "monitor restarted daemon");
-
-    // Native login belongs to the pod, including when the host logs out while
-    // the daemon is stopped and there is no live state to suppress an upload.
-    fs::remove_file(home.path().join(".codex/auth.json"))
-        .expect("remove host credentials before reconnecting to the pod-owned login");
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
