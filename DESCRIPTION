@@ -1,4 +1,4 @@
-Adopt native Codex daemons from mbid/main
+Adopt native Codex daemons
 
 Install complete Codex release packages matching the local CLI so native
 package discovery and bundled tools keep working. Pin development tests
