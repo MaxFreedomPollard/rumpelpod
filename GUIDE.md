@@ -533,22 +533,50 @@ The `claude` object configures the `rumpel claude` command.
 The `codex` object configures the `rumpel codex` command.
 
 Pods receive the complete Codex release package matching the version of the
-local CLI, including its manifest and bundled tools. Rumpelpod manages the
-app-server process: it survives client disconnects and starts again on the next
-connection if it exits or the pod restarts. It does not install a native Codex
-daemon service or automatically upgrade Codex inside the pod.
+local CLI, including its manifest and bundled tools. The first `rumpel codex`
+invocation starts Codex's native daemon. Rumpelpod bridges the local TUI to its
+Unix socket; Codex owns its managed package, updates, and process lifecycle.
+Image preparation installs procps if the image's ps lacks the native daemon's
+required options (using apt or apk). Other images need procps preinstalled.
+Installing Codex or using another agent does not activate the daemon.
+Existing pods keep their installed Rumpelpod binary and previous app-server
+lifecycle. Both implementations expose the same interface to the host daemon.
+
+After activation, the daemon survives TUI disconnects. Rumpelpod starts it again
+when a frontend needs it or when Rumpelpod starts the existing pod. This uses the
+existing container server setup, without changing the container's entrypoint.
+A new or forked pod needs its own `rumpel codex` invocation to activate
+this startup behavior.
+
+Use native Codex commands inside the pod to manage the same daemon, for example:
+
+```sh
+rumpel enter dev -- /opt/rumpelpod/bin/codex app-server daemon version
+rumpel enter dev -- /opt/rumpelpod/bin/codex app-server daemon restart
+rumpel enter dev -- /opt/rumpelpod/bin/codex remote-control start
+rumpel enter dev -- /opt/rumpelpod/bin/codex remote-control pair
+```
+
+Remote control requires Codex's ChatGPT login and the corresponding experimental
+mobile access. Pairing and remote-control settings belong to Codex; Rumpelpod
+adds no separate pairing command or remote-control flag. Forks keep conversations
+and login credentials but get a new installation identity with remote control
+disabled; pair the fork separately.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `dangerouslyBypassApprovalsAndSandbox` | bool | `true` | sets the Codex app-server's startup defaults to bypass approvals and sandboxing. The pod already provides an isolated environment, so Codex does not need its own sandbox on top. |
+| `dangerouslyBypassApprovalsAndSandbox` | bool | `true` | initializes the pod's Codex config to bypass approvals and sandboxing. The pod already provides an isolated environment, so Codex does not need its own sandbox on top. |
 
-`--no-dangerously-bypass-approvals-and-sandbox` disables these startup overrides.
-With bypass enabled, new threads inherit the app-server's defaults until you
-choose permissions in Codex. That choice also applies to subsequent `/new`
-commands. An existing app-server keeps its startup defaults; resumed threads
-keep their saved permissions. Use the opt-out flag when forwarding your own permission
-flags to Codex. The effective setting travels with each connection to the pod, so
-it is supplied again when a connection starts an app-server after a restart.
+On first use, Rumpelpod copies local Codex credentials and config into the pod.
+`--no-dangerously-bypass-approvals-and-sandbox` preserves the configured permission
+defaults during that initialization. Later connections preserve the pod's
+credentials and config, including native login refreshes and edits. Change
+`~/.codex/config.toml` inside the pod to change its persistent defaults.
+
+With bypass enabled, new threads inherit the daemon's defaults until you choose
+permissions in Codex. That choice also applies to subsequent `/new` commands;
+resumed threads keep their saved permissions. Use the opt-out flag when forwarding
+your own permission flags to the TUI.
 
 ### `pi`
 

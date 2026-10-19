@@ -30,6 +30,7 @@ hex = ">= 0"
 serde = { version = ">= 0", features = ["derive"] }
 serde_json = { version = ">= 0", features = ["preserve_order"] }
 json5 = ">= 0"
+toml_edit = ">= 0"
 notify = ">= 0"
 tokio = { version = ">= 0", features = ["full"] }
 dirs = ">= 0"
@@ -55,7 +56,7 @@ hyper = { version = ">= 0", features = ["server", "http1"] }
 hyper-util = { version = ">= 0", features = ["tokio"] }
 tower = { version = ">= 0", features = ["util"] }
 cgi-service = ">= 0"
-rusqlite = { version = ">= 0", features = ["bundled", "chrono"] }
+rusqlite = { version = ">= 0", features = ["bundled", "chrono", "backup"] }
 socket2 = ">= 0"
 tower-service = ">= 0"
 futures-core = ">= 0"

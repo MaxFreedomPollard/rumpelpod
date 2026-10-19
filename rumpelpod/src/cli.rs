@@ -679,7 +679,7 @@ pub struct CodexCommand {
     #[arg(long)]
     pub create: bool,
 
-    /// Use Codex's configured permissions when starting its app-server
+    /// Keep configured permissions when initializing Codex in this pod
     #[arg(long)]
     pub no_dangerously_bypass_approvals_and_sandbox: bool,
 

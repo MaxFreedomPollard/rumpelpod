@@ -4,7 +4,7 @@
 //! Startup defaults must reach new app-servers without overriding saved threads.
 
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use indoc::formatdoc;
 use rumpelpod::CommandExt;
@@ -15,7 +15,7 @@ use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, 
 use crate::executor::executor_supports_stop;
 
 const NO_BYPASS: &str = "--no-dangerously-bypass-approvals-and-sandbox";
-const APP_SERVER_PATTERN: &str = "^/opt/rumpelpod/bin/codex app-server ";
+const APP_SERVER_PATTERN: &str = "^.*/codex app-server --listen unix://";
 
 fn configure_read_only(home: &TestHome) {
     let path = home.path().join(".codex/config.toml");
@@ -104,6 +104,8 @@ fn codex_permissions_new_threads_keep_default_bypass() {
     session.wait_for_ready();
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    // Codex streams the answer before it accepts commands for another thread.
+    session.wait_for_with_timeout("Worked for", Duration::from_secs(30));
     session.send("/new");
     // The full-screen UI replaces the previous transcript when the new thread
     // is configured. Wait for that replacement before inspecting its settings.
@@ -120,6 +122,7 @@ fn codex_permissions_picker_survives_new_thread() {
     session.wait_for_ready();
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    session.wait_for_with_timeout("Worked for", Duration::from_secs(30));
     session.send("/permissions");
     session.wait_for_with_timeout("4. Read Only", Duration::from_secs(30));
     session.write_raw(b"4\r");
@@ -127,8 +130,30 @@ fn codex_permissions_picker_survives_new_thread() {
         "Permission selection requested: Read Only",
         Duration::from_secs(30),
     );
-    session.send("/status");
-    session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
+    // Selection is asynchronous and /status is a snapshot. Refresh it until
+    // the server confirms the choice before checking inheritance through /new.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        session.send_with_timeout(
+            "/status",
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        session.wait_for_absent_with_timeout(
+            "\u{203a} /status",
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        let contents = session.screen().contents();
+        if contents
+            .rsplit_once("Permissions:")
+            .is_some_and(|(_, status)| {
+                status
+                    .trim_start()
+                    .starts_with("Read Only (Ask for approval)")
+            })
+        {
+            break;
+        }
+    }
     session.send("/new");
     session.wait_for_absent_with_timeout("Paris", Duration::from_secs(30));
     session.send("/status");
@@ -146,7 +171,8 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     first.send("What is the capital of France? Reply with just the city name, nothing else.");
     first.wait_for_with_timeout("Paris", Duration::from_secs(30));
     let original = app_server_command(&repo, &daemon);
-    assert!(original.contains("default_permissions=\":danger-full-access\""));
+    assert!(original.contains("--listen unix://"), "{original}");
+    assert!(!original.contains(" -c "), "{original}");
     first.send("/exit");
     first.wait_for_exit();
 
@@ -173,8 +199,8 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         .success()
         .expect("kill only this test's app-server");
 
-    // The daemon and its cached proxy survive this failure. The replacement
-    // server must receive the current opt-out, while the saved thread keeps full access.
+    // Native PID recovery must work through the cached proxy. Changing the
+    // frontend preference must not rewrite the pod config or saved thread.
     let mut third = CodexSession::spawn_named_with_rumpel_args(
         &repo,
         &daemon,
@@ -216,16 +242,26 @@ fn codex_permissions_survive_pod_restart() {
         .success()
         .expect("stop the test pod");
 
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "/opt/rumpelpod/bin/codex",
+            "app-server",
+            "daemon",
+            "version",
+        ])
+        .success()
+        .expect("pod restart restores an activated daemon without a TUI");
+
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
     resumed.send("/status");
     resumed.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     let command = app_server_command(&repo, &daemon);
-    assert!(command.contains("approval_policy=\"never\""), "{command}");
-    assert!(
-        command.contains("default_permissions=\":danger-full-access\""),
-        "{command}"
-    );
+    assert!(command.contains("--listen unix://"), "{command}");
+    assert!(!command.contains(" -c "), "{command}");
 }
 
 fn app_server_command(repo: &TestRepo, daemon: &TestDaemon) -> String {
