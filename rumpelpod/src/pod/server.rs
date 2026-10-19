@@ -86,7 +86,7 @@ pub struct PodServerState {
     /// Pod name (the value also written to `git config rumpelpod.pod-name`).
     /// Used by /agent-files/<claude> to rebuild the statusLine on extract.
     pub pod_name: String,
-    /// Codex app-server child process, started on first /codex connection.
+    /// Native Codex daemon socket, discovered on startup or first connection.
     pub codex_app_server: super::codex::CodexAppServer,
     /// Current Claude Code session state, updated by hooks.
     pub claude_state: tokio::sync::watch::Sender<Option<super::types::ClaudeState>>,
@@ -260,14 +260,6 @@ pub fn run_container_server(
             });
         }
 
-        // Any codex app-server we advertised belonged to a previous
-        // container-serve; this process will never proxy to it, so
-        // drop the record before anything can mistake it for live.
-        crate::port_file::remove_if_present(Path::new(
-            crate::port_file::CODEX_APP_SERVER_PORT_FILE,
-        ))
-        .expect("clearing stale codex app-server port file");
-
         // Reuse the previously recorded port if the file is still
         // around (stable ports across a container restart aid
         // debugging); otherwise let the kernel pick.  Remove the file
@@ -342,9 +334,12 @@ pub fn run_container_server(
                     &lifecycle_config,
                     &lifecycle_error,
                     &setup_progress_tx,
-                    &setup_done_tx,
                     &slow_tx,
                 );
+                block_on(super::codex::restore_daemon(&state, &repo_path))
+                    .expect("restoring native Codex daemon failed");
+                let _ = setup_progress_tx.send("setup complete.".to_string());
+                let _ = setup_done_tx.send(true);
             }));
             if let Err(payload) = result {
                 let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -378,8 +373,7 @@ impl Drop for SetupDoneGuard<'_> {
 
 /// Run the setup steps that used to block before the server accepted
 /// connections.  Now runs on a background task after the server is
-/// already listening.  Sends progress lines through `progress_tx` and
-/// signals completion through `done_tx`.
+/// already listening. Sends progress lines through `progress_tx`.
 #[allow(clippy::too_many_arguments)]
 fn run_setup(
     repo_path: &Path,
@@ -393,7 +387,6 @@ fn run_setup(
     lifecycle_config_out: &std::sync::Arc<std::sync::Mutex<crate::devcontainer::LifecycleConfig>>,
     lifecycle_error_out: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
     progress_tx: &tokio::sync::broadcast::Sender<String>,
-    done_tx: &tokio::sync::watch::Sender<SetupDone>,
     slow_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
     // Best-effort progress reporting; receivers may not exist yet.
@@ -521,9 +514,6 @@ fn run_setup(
             break;
         }
     }
-
-    progress("setup complete.");
-    let _ = done_tx.send(true);
 }
 
 /// Middleware that rejects requests without a valid Bearer token.
@@ -1978,23 +1968,32 @@ async fn agent_files_get_handler(
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let home_for_thread = home.clone();
     tokio::task::spawn_blocking(move || {
-        let writer = ChannelWriter { tx };
+        let writer = ChannelWriter { tx: tx.clone() };
         let mut archive = tar::Builder::new(writer);
         archive.follow_symlinks(false);
         for rel in &existing {
             let full = home_for_thread.join(rel);
-            let res = if full.is_dir() {
+            let res = if agent == "codex" {
+                super::codex::archive_state(&mut archive, &home_for_thread)
+                    .map_err(std::io::Error::other)
+            } else if full.is_dir() {
                 archive.append_dir_all(rel, &full)
             } else {
                 archive.append_path_with_name(&full, rel)
             };
             if let Err(e) = res {
                 eprintln!("agent-files {rel}: {e:#}");
+                if let Err(error) = tx.blocking_send(Err(e)) {
+                    eprintln!("agent-files: reporting snapshot failure: {error}");
+                }
                 return;
             }
         }
         if let Err(e) = archive.into_inner() {
             eprintln!("agent-files finalize: {e:#}");
+            if let Err(error) = tx.blocking_send(Err(e)) {
+                eprintln!("agent-files: reporting finalization failure: {error}");
+            }
         }
     });
 
@@ -2013,6 +2012,9 @@ struct AgentFilesPutQuery {
     /// Override for the PermissionRequest hook on claude.  When omitted,
     /// whatever the uploaded settings.json carries is preserved.
     permission_hook: Option<bool>,
+    /// A fork is a new mobile host; recreation preserves the existing identity.
+    #[serde(default)]
+    forked: bool,
 }
 
 /// PUT /agent-files/<agent> -- extract a tar.gz body under $HOME, then
@@ -2024,7 +2026,8 @@ struct AgentFilesPutQuery {
 /// PermissionRequest hook is left as-is unless `?permission_hook=` is
 /// set.
 ///
-/// For `codex` and `grok`, no post-extraction work.
+/// Codex forks retain conversations but receive a fresh mobile host identity.
+/// Grok requires no post-extraction work.
 async fn agent_files_put_handler(
     State(state): State<PodServerState>,
     axum::extract::Path(agent): axum::extract::Path<String>,
@@ -2051,13 +2054,23 @@ async fn agent_files_put_handler(
     let test_mode = state.test_mode;
     let agent_for_blocking = agent.clone();
     tokio::task::spawn_blocking(move || {
-        agent_files_put_impl(
+        let mut reader = sync_reader;
+        let result = agent_files_put_impl(
             &agent_for_blocking,
-            sync_reader,
+            &mut reader,
             &pod_name,
             query.permission_hook,
+            query.forked,
             test_mode,
-        )
+        );
+        // Finish consuming a rejected upload so the client receives the
+        // extraction error instead of a broken pipe while sending the body.
+        if result.is_err() {
+            if let Err(error) = std::io::copy(&mut reader, &mut std::io::sink()) {
+                eprintln!("agent-files {agent_for_blocking}: draining failed upload: {error}");
+            }
+        }
+        result
     })
     .await
     .expect("agent_files_put_impl panicked")
@@ -2071,6 +2084,7 @@ fn agent_files_put_impl(
     reader: impl std::io::Read,
     pod_name: &str,
     permission_hook: Option<bool>,
+    forked: bool,
     test_mode: bool,
 ) -> Result<()> {
     let home = server_home()?;
@@ -2125,7 +2139,11 @@ fn agent_files_put_impl(
 
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
-        "codex" => {}
+        "codex" => {
+            if forked {
+                super::codex::reset_fork_identity(&home)?;
+            }
+        }
         "pi" => {}
         // Grok needs no post-extraction work: its notify-state hooks are
         // not wired up, so there is no settings file to rewrite.

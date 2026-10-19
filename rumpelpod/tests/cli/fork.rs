@@ -5,6 +5,8 @@
 
 use std::fs;
 
+use indoc::indoc;
+
 use crate::common::{
     ensure_pi_config_via_daemon, launch_pod_via_daemon, pod_command, write_host_pi_settings,
     write_test_devcontainer, write_test_devcontainer_with_fake_pi, TestDaemon, TestHome, TestRepo,
@@ -118,7 +120,12 @@ fn fork_preserves_codex_state_symlinks() {
             "--",
             "sh",
             "-c",
-            r#"mkdir -p "$HOME/.codex/tmp" && printf target > /tmp/codex-target && ln -s /tmp/codex-target "$HOME/.codex/tmp/link""#,
+            indoc! {r#"
+                mkdir -p "$HOME/.codex/skills" "$HOME/.codex/tmp" &&
+                printf target > /tmp/codex-target &&
+                ln -s /tmp/codex-target "$HOME/.codex/skills/link" &&
+                ln -s /tmp/codex-target "$HOME/.codex/tmp/link"
+            "#},
         ])
         .success()
         .expect("create codex symlink state failed");
@@ -135,7 +142,11 @@ fn fork_preserves_codex_state_symlinks() {
             "--",
             "sh",
             "-c",
-            r#"test -L "$HOME/.codex/tmp/link" && readlink "$HOME/.codex/tmp/link""#,
+            indoc! {r#"
+                test ! -e "$HOME/.codex/tmp" &&
+                test -L "$HOME/.codex/skills/link" &&
+                readlink "$HOME/.codex/skills/link"
+            "#},
         ])
         .success()
         .expect("read forked codex symlink failed");

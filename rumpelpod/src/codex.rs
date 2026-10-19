@@ -219,17 +219,15 @@ fn build_codex_spec(
     let bypass = !no_dangerously_bypass_approvals_and_sandbox
         && json_config.codex.dangerously_bypass_approvals_and_sandbox;
 
-    // A non-empty state came from the pod's live event connection and means
-    // its Codex app server already ran with the credentials copied before the
-    // first frontend was created. A live local frontend bypasses this builder
-    // entirely, even when its pod connection is temporarily unavailable.
+    // Provision only once: native login refreshes and config edits belong to
+    // the pod and must survive daemon or container restarts.
     if codex_state.is_none() {
         let pod = crate::pod::PodClient::new_with_timeout(
             &container_url,
             &container_token,
             Duration::from_secs(30),
         )?;
-        write_codex_credentials(&pod)?;
+        write_codex_credentials(&pod, bypass)?;
     }
 
     // Bind a per-pod loopback proxy that forwards to the pod's /codex.
@@ -266,12 +264,31 @@ pub(crate) fn codex_session_name(repo_path: &std::path::Path, pod_name: &str) ->
     format!("codex:{repo_path}:{pod_name}")
 }
 
-/// Copy the local machine's codex credentials into the pod.
-///
-/// Builds a tar of ~/.codex/auth.json (and config.toml if present) on
-/// the local machine, streams it through PUT /agent-files/codex.  The
-/// user is expected to have run `codex login` beforehand.
-fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
+/// Seed a new pod from local Codex credentials and config. Existing pod
+/// credentials belong to Codex and may have been refreshed since the copy.
+fn write_codex_credentials(pod: &crate::pod::PodClient, bypass: bool) -> Result<()> {
+    let existing = pod.run(
+        &[
+            "sh",
+            "-c",
+            "test -f \"$1\" || test -f \"$HOME/.codex/auth.json\"",
+            "codex-provisioned",
+            crate::pod::codex::DAEMON_ENABLED_FILE,
+        ],
+        None,
+        &[],
+        None,
+        None,
+    )?;
+    match existing.exit_code {
+        0 => return Ok(()),
+        1 => {}
+        code => {
+            return Err(anyhow::anyhow!(
+                "checking pod Codex credentials failed (exit {code})"
+            ))
+        }
+    }
     let local_home = dirs::home_dir().context("could not determine home directory")?;
     let auth_path = local_home.join(".codex/auth.json");
     if !auth_path.exists() {
@@ -280,31 +297,41 @@ fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
         ));
     }
 
-    let codex_dir = local_home.join(".codex");
-    let entries: Vec<(String, std::path::PathBuf)> = vec![
-        (".codex/auth.json".to_string(), auth_path.clone()),
-        (
-            ".codex/config.toml".to_string(),
-            codex_dir.join("config.toml"),
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, p)| p.exists())
-    .collect();
+    let config_path = local_home.join(".codex/config.toml");
+    let raw_config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("reading local Codex config"),
+    };
+    let mut config = raw_config
+        .parse::<toml_edit::DocumentMut>()
+        .context("parsing local Codex config")?;
+    // Native daemon startup intentionally does not forward general -c flags.
+    // Persist the pod's initial defaults so native and remote clients agree.
+    if bypass {
+        config["approval_policy"] = toml_edit::value("never");
+        config["default_permissions"] = toml_edit::value(":danger-full-access");
+    }
+    let config = config.to_string();
 
     let (read_end, write_end) = std::io::pipe().context("creating pipe for codex tar")?;
     let handle = std::thread::spawn(move || -> Result<()> {
         let mut archive = tar::Builder::new(write_end);
-        for (rel, src) in &entries {
-            archive
-                .append_path_with_name(src, rel)
-                .with_context(|| format!("archiving {rel}"))?;
-        }
+        archive
+            .append_path_with_name(auth_path, ".codex/auth.json")
+            .context("archiving Codex credentials")?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(config.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, ".codex/config.toml", config.as_bytes())
+            .context("archiving initial Codex config")?;
         archive.into_inner().context("finalizing codex tar")?;
         Ok(())
     });
 
-    pod.put_agent_files("codex", read_end, None)
+    pod.put_agent_files("codex", read_end, None, false)
         .context("uploading codex credentials")?;
     handle
         .join()

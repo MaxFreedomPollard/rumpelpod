@@ -1,0 +1,14 @@
+Use the native Codex daemon in activated pods
+
+Let Codex manage its app server, package updates, and remote control.
+Bridge the host frontend to the native Unix socket so ordinary Codex
+lifecycle and mobile pairing commands address the same instance.
+
+Activate background startup only after rumpel codex is used in a pod.
+Restore activated daemons through the existing container server setup,
+without changing container entrypoints. Persist initial permission
+defaults and retain the pod's credentials and config on reconnect.
+
+Provide procps where native process management needs it. Exclude runtime
+artifacts from snapshots and reset mobile identity only when forking,
+so a fork cannot impersonate the source pod.

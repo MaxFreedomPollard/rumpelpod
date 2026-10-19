@@ -32,7 +32,7 @@ const CLAUDE_CODE_DIST_BUCKET: &str =
 
 /// Bump this when the Dockerfile template or provisioning changes in a way that
 /// invalidates previously built prepared images.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// File baked into the prepared image listing the container env var
 /// names the daemon resolved from `containerEnv` and `--env-file` at
@@ -1497,6 +1497,7 @@ fn install_claude_cli(version: &str) -> Result<()> {
 }
 
 fn install_codex_cli(version: &str) -> Result<()> {
+    ensure_codex_daemon_ps()?;
     // The musl releases run independently of the devcontainer's libc.
     let target = match std::env::consts::ARCH {
         "x86_64" => "x86_64-unknown-linux-musl",
@@ -1577,6 +1578,48 @@ fn install_codex_cli(version: &str) -> Result<()> {
             .with_context(|| format!("linking {destination} to Codex package"))?;
     }
     Ok(())
+}
+
+/// Native Codex uses ps to identify its detached processes. BusyBox ps lacks
+/// these options even though the musl Codex binary itself runs on Alpine.
+fn ensure_codex_daemon_ps() -> Result<()> {
+    if codex_daemon_ps_works()? {
+        return Ok(());
+    }
+    if crate::which("apt-get").is_some() {
+        run_pkg_install("apt-get", &[&["update"], &["install", "-y", "procps"]])?;
+    } else if crate::which("apk").is_some() {
+        run_pkg_install("apk", &[&["add", "--no-cache", "procps"]])?;
+    } else {
+        return Err(anyhow::anyhow!(
+            "Codex's native daemon requires procps ps; install procps (procps-ng on some distributions) in the devcontainer image"
+        ));
+    }
+    if !codex_daemon_ps_works()? {
+        return Err(anyhow::anyhow!(
+            "installed ps does not support Codex's native daemon"
+        ));
+    }
+    Ok(())
+}
+
+fn codex_daemon_ps_works() -> Result<bool> {
+    let output = match Command::new("ps")
+        .args([
+            "-p",
+            &std::process::id().to_string(),
+            "-o",
+            "stat=",
+            "-o",
+            "lstart=",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("checking ps for Codex's native daemon"),
+    };
+    Ok(output.status.success() && !output.stdout.is_empty())
 }
 
 /// Install the pi coding agent CLI at a specific version via npm.
@@ -1660,7 +1703,7 @@ fn ensure_node() -> Result<PathBuf> {
     // packaged node may still be too old, in which case we fall through
     // to the standalone download.
     if crate::which("apt-get").is_some() {
-        run_node_pkg_install(
+        run_pkg_install(
             "apt-get",
             &[&["update"], &["install", "-y", "nodejs", "npm"]],
         )?;
@@ -1668,7 +1711,7 @@ fn ensure_node() -> Result<PathBuf> {
             return Ok(dir);
         }
     } else if crate::which("apk").is_some() {
-        run_node_pkg_install("apk", &[&["add", "--no-cache", "nodejs", "npm"]])?;
+        run_pkg_install("apk", &[&["add", "--no-cache", "nodejs", "npm"]])?;
         if let Some(dir) = usable_node_bin_dir() {
             return Ok(dir);
         }
@@ -1679,12 +1722,12 @@ fn ensure_node() -> Result<PathBuf> {
 
 /// Run a sequence of package-manager invocations (e.g. apt-get update,
 /// then install).  Errors if any step fails.
-fn run_node_pkg_install(manager: &str, arg_sets: &[&[&str]]) -> Result<()> {
+fn run_pkg_install(manager: &str, arg_sets: &[&[&str]]) -> Result<()> {
     for args in arg_sets {
         let status = Command::new(manager)
             .args(*args)
             .status()
-            .with_context(|| format!("running {manager} to install Node.js"))?;
+            .with_context(|| format!("running {manager} to install agent dependencies"))?;
         if !status.success() {
             return Err(anyhow::anyhow!("{manager} {args:?} failed"));
         }

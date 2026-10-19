@@ -25,7 +25,7 @@
 
   // 2x: Prepared-image installs, remaining k8s/compose/SSH reconnect cases.
   "claude::install::image_includes_claude_from_client_path": 2,
-  "codex::host_network::codex_app_server_ports_are_isolated_on_host_network": 2,
+  "codex::host_network::codex_daemons_are_isolated_on_host_network": 2,
   "codex::install::image_includes_codex_from_client_path": 2,
   "codex::workdir::codex_app_server_starts_in_workspace": 2,
   "devcontainer::compose::compose_default_command_exit_has_actionable_error": 2,
