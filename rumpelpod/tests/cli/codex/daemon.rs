@@ -3,12 +3,13 @@
 
 //! Native lifecycle commands must address the server used by rumpel codex.
 
+use std::fs;
 use std::time::Duration;
 
 use indoc::indoc;
 use rumpelpod::CommandExt;
 
-use super::common::{setup_codex_test_repo, CodexSession};
+use super::common::{setup_codex_test_repo, setup_controlled_home, CodexSession};
 use crate::common::{pod_command, write_test_devcontainer};
 use crate::executor::executor_supports_stop;
 
@@ -70,6 +71,24 @@ fn codex_daemon_is_not_activated_by_installation() {
         stopped["status"], "notRunning",
         "unactivated daemon restarted"
     );
+}
+
+#[test]
+fn codex_first_use_requires_credentials() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    fs::remove_file(home.path().join(".codex/auth.json"))
+        .expect("remove credentials before first use");
+    let mut missing_login = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    missing_login.wait_for_with_timeout(
+        "no codex credentials found on the host or in the pod",
+        Duration::from_secs(30),
+    );
+    missing_login.wait_for_exit();
+
+    // A failed initialization must still accept credentials on the next try.
+    setup_controlled_home(&home);
+    let mut logged_in = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    logged_in.wait_for_ready();
 }
 
 #[test]
@@ -219,6 +238,11 @@ fn codex_native_commands_manage_the_frontends_daemon() {
         .expect("probe stopped native daemon");
     let stopped: serde_json::Value = serde_json::from_slice(&output).expect("native stop JSON");
     assert_eq!(stopped["status"], "notRunning", "monitor restarted daemon");
+
+    // Native login belongs to the pod, including when the host logs out while
+    // the daemon is stopped and there is no live state to suppress an upload.
+    fs::remove_file(home.path().join(".codex/auth.json"))
+        .expect("remove host credentials before reconnecting to the pod-owned login");
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));

@@ -570,8 +570,9 @@ disabled; pair the fork separately.
 On first use, Rumpelpod copies local Codex credentials and config into the pod.
 `--no-dangerously-bypass-approvals-and-sandbox` preserves the configured permission
 defaults during that initialization. Later connections preserve the pod's
-credentials and config, including native login refreshes and edits. Change
-`~/.codex/config.toml` inside the pod to change its persistent defaults.
+credentials and config, including native login refreshes and edits. A pod with
+its own login can reconnect even after credentials are removed from the host.
+Change `~/.codex/config.toml` inside the pod to change its persistent defaults.
 
 With bypass enabled, new threads inherit the daemon's defaults until you choose
 permissions in Codex. That choice also applies to subsequent `/new` commands;

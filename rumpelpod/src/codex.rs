@@ -220,10 +220,10 @@ fn build_codex_spec(
     let bypass = !no_dangerously_bypass_approvals_and_sandbox
         && json_config.codex.dangerously_bypass_approvals_and_sandbox;
 
-    // A non-empty state came from the pod's live event connection and means
-    // its Codex app server already ran with the credentials copied before the
-    // first frontend was created. A live local frontend bypasses this builder
-    // entirely, even when its pod connection is temporarily unavailable.
+    // Live state means Codex is already initialized. Without it, offer local
+    // credentials so the pod can initialize or retain its native login. A live
+    // local frontend bypasses this builder entirely, even when its pod
+    // connection is temporarily unavailable.
     if codex_state.is_none() {
         let pod = crate::pod::PodClient::new_with_timeout(
             &container_url,
@@ -269,29 +269,21 @@ pub(crate) fn codex_session_name(repo_path: &std::path::Path, pod_name: &str) ->
 
 /// Copy the local machine's codex credentials into the pod.
 ///
-/// Builds a tar of ~/.codex/auth.json (and config.toml if present) on
-/// the local machine, streams it through PUT /agent-files/codex.  The
-/// user is expected to have run `codex login` beforehand.
+/// Offer local auth and config when present. The pod decides whether it
+/// needs them: native login and refreshes can outlive the host's credentials.
 fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
     let local_home = dirs::home_dir().context("could not determine home directory")?;
-    let auth_path = local_home.join(".codex/auth.json");
-    if !auth_path.exists() {
-        return Err(anyhow::anyhow!(
-            "no codex credentials found at ~/.codex/auth.json. Run `codex login` first."
-        ));
-    }
-
     let codex_dir = local_home.join(".codex");
-    let entries: Vec<(String, std::path::PathBuf)> = vec![
-        (".codex/auth.json".to_string(), auth_path.clone()),
-        (
-            ".codex/config.toml".to_string(),
-            codex_dir.join("config.toml"),
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, p)| p.exists())
-    .collect();
+    let mut entries = Vec::new();
+    for name in ["auth.json", "config.toml"] {
+        let path = codex_dir.join(name);
+        if path
+            .try_exists()
+            .with_context(|| format!("checking local Codex {name}"))?
+        {
+            entries.push((format!(".codex/{name}"), path));
+        }
+    }
 
     let (read_end, write_end) = std::io::pipe().context("creating pipe for codex tar")?;
     let handle = std::thread::spawn(move || -> Result<()> {

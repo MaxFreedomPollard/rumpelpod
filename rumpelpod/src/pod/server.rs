@@ -2156,6 +2156,20 @@ fn agent_files_put_impl(
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
         "codex" => {
+            // A reconnect may have no host credentials even though native
+            // login has already initialized this pod. Only first use needs
+            // an uploaded login; snapshots may also represent logged-out pods.
+            if codex_snapshot_source.is_none()
+                && !preserve_codex_credentials
+                && !home
+                    .join(".codex/auth.json")
+                    .try_exists()
+                    .context("checking initial pod Codex credentials")?
+            {
+                return Err(anyhow::anyhow!(
+                    "no codex credentials found on the host or in the pod. Run `codex login` first."
+                ));
+            }
             if codex_snapshot_source.is_some_and(|source| source != pod_name) {
                 super::codex::reset_fork_identity(&home)?;
             }
