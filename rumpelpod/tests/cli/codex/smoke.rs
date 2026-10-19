@@ -17,11 +17,9 @@ fn codex_smoke() {
     // Exercise the app-server's default permission bypass and Codex's own model.
     let mut session = CodexSession::spawn(&repo, &daemon, _home.path(), &[]);
 
-    // Dismiss any startup dialogs (model selection, announcements)
-    // by pressing Enter whenever the TUI is waiting.
-    session.dismiss_dialogs();
+    session.wait_for_ready();
     let contents = session.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    assert!(contents.contains("Full Access"), "{contents}");
 
     session.send("Run `printf %x 3735928559`.");
     session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));

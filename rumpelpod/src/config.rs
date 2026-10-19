@@ -686,7 +686,7 @@ pub struct SessionsConfig {}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CodexConfig {
-    /// Bypass approvals and sandboxing by default in a new Codex app-server.
+    /// Initialize a pod's Codex config with approvals and sandboxing disabled.
     /// The pod provides the sandbox so codex does not need its own.
     /// Defaults to true.
     #[serde(default = "default_true")]

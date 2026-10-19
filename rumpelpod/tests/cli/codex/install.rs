@@ -8,6 +8,8 @@
 use std::fs;
 use std::process::Command;
 
+use indoc::indoc;
+
 use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::ExecutorResources;
 use rumpelpod::CommandExt;
@@ -65,4 +67,41 @@ fn image_includes_codex_from_client_path() {
         pod_version, host_version,
         "pod Codex version should match the host version",
     );
+
+    let manifest = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "codex-install-test",
+            "--",
+            "cat",
+            "/opt/rumpelpod/codex/codex-package.json",
+        ])
+        .success()
+        .expect("Codex package manifest should be installed");
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["layoutVersion"], 1);
+    assert_eq!(
+        manifest["version"],
+        host_version.strip_prefix("codex-cli ").unwrap(),
+    );
+
+    // A working CLI alone is insufficient: Codex discovers its installation
+    // through the real executable path and needs the package's companion tools.
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "codex-install-test",
+            "--",
+            "sh",
+            "-ec",
+            indoc! {r#"
+                test "$(readlink -f /opt/rumpelpod/bin/codex)" = /opt/rumpelpod/codex/bin/codex
+                test "$(readlink -f /opt/rumpelpod/bin/codex-code-mode-host)" = /opt/rumpelpod/codex/bin/codex-code-mode-host
+                test -x /opt/rumpelpod/codex/bin/codex-code-mode-host
+                /opt/rumpelpod/codex/codex-path/rg --version
+                /opt/rumpelpod/codex/codex-resources/bwrap --version
+            "#},
+        ])
+        .success()
+        .expect("Codex package resources should be usable by the pod user");
 }

@@ -14,7 +14,7 @@ fn codex_relaunch_resumes_last_remote_session() {
     // The fresh pod has no thread, so this also verifies that resume --last
     // falls through to creating one rather than rejecting the first launch.
     let mut first = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    first.dismiss_dialogs();
+    first.wait_for_ready();
     first.send("What is the capital of France? Reply with just the city name, nothing else.");
     first.wait_for("Paris");
 
@@ -25,8 +25,8 @@ fn codex_relaunch_resumes_last_remote_session() {
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    let contents = resumed.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
+    resumed.send("/status");
+    resumed.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     resumed.send("Run `printf %x 3735928559`.");
     resumed.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }
