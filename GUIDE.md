@@ -539,6 +539,8 @@ Unix socket; Codex owns its managed package, updates, and process lifecycle.
 Image preparation installs procps if the image's ps lacks the native daemon's
 required options (using apt or apk). Other images need procps preinstalled.
 Installing Codex or using another agent does not activate the daemon.
+Existing pods keep their installed Rumpelpod binary and previous app-server
+lifecycle. Both implementations expose the same interface to the host daemon.
 
 After activation, the daemon survives TUI disconnects. Rumpelpod starts it again
 when a frontend needs it or when Rumpelpod starts the existing pod. This uses the

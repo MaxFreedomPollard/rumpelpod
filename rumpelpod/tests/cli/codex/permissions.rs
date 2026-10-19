@@ -254,8 +254,6 @@ fn codex_permissions_survive_pod_restart() {
         ])
         .success()
         .expect("pod restart restores an activated daemon without a TUI");
-    // The native daemon owns refreshed credentials after initialization.
-    fs::remove_file(home.path().join(".codex/auth.json")).expect("remove host credentials");
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));

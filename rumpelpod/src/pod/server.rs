@@ -10,6 +10,7 @@
 //! operations in Rust instead of composing shell scripts via docker exec.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -1921,7 +1922,7 @@ fn agent_paths(agent: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Resolve the home directory of the user this server runs as.
-fn server_home() -> Result<PathBuf> {
+pub(super) fn server_home() -> Result<PathBuf> {
     let user = nix::unistd::User::from_uid(nix::unistd::getuid())
         .context("looking up server uid")?
         .context("server uid not found in passwd")?;
@@ -1937,7 +1938,6 @@ async fn agent_files_get_handler(
     State(state): State<PodServerState>,
     axum::extract::Path(agent): axum::extract::Path<String>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
-    let _ = state; // PodServerState is the auth gate; nothing else needed.
     let paths = agent_paths(&agent).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1974,7 +1974,7 @@ async fn agent_files_get_handler(
         for rel in &existing {
             let full = home_for_thread.join(rel);
             let res = if agent == "codex" {
-                super::codex::archive_state(&mut archive, &home_for_thread)
+                super::codex::archive_state(&mut archive, &home_for_thread, &state.pod_name)
                     .map_err(std::io::Error::other)
             } else if full.is_dir() {
                 archive.append_dir_all(rel, &full)
@@ -2012,9 +2012,6 @@ struct AgentFilesPutQuery {
     /// Override for the PermissionRequest hook on claude.  When omitted,
     /// whatever the uploaded settings.json carries is preserved.
     permission_hook: Option<bool>,
-    /// A fork is a new mobile host; recreation preserves the existing identity.
-    #[serde(default)]
-    forked: bool,
 }
 
 /// PUT /agent-files/<agent> -- extract a tar.gz body under $HOME, then
@@ -2060,7 +2057,6 @@ async fn agent_files_put_handler(
             &mut reader,
             &pod_name,
             query.permission_hook,
-            query.forked,
             test_mode,
         );
         // Finish consuming a rejected upload so the client receives the
@@ -2084,10 +2080,11 @@ fn agent_files_put_impl(
     reader: impl std::io::Read,
     pod_name: &str,
     permission_hook: Option<bool>,
-    forked: bool,
     test_mode: bool,
 ) -> Result<()> {
     let home = server_home()?;
+    let preserve_codex_credentials = agent == "codex" && super::codex::preserve_credentials(&home)?;
+    let mut codex_snapshot_source = None;
 
     // The router's RequestDecompressionLayer already gunzipped the
     // body when the client sent Content-Encoding: gzip, so the reader
@@ -2099,6 +2096,23 @@ fn agent_files_put_impl(
         let mut entry = entry.context("reading tar entry")?;
         let rel = entry.path().context("reading entry path")?.into_owned();
         if rel.as_os_str().is_empty() || rel.is_absolute() {
+            continue;
+        }
+        if agent == "codex" && rel == Path::new(super::codex::SNAPSHOT_SOURCE_FILE) {
+            let mut source = String::new();
+            entry
+                .read_to_string(&mut source)
+                .context("reading Codex snapshot source")?;
+            codex_snapshot_source = Some(source);
+            continue;
+        }
+        if preserve_codex_credentials
+            && codex_snapshot_source.is_none()
+            && matches!(
+                rel.to_str(),
+                Some(".codex/auth.json" | ".codex/config.toml")
+            )
+        {
             continue;
         }
         let target = home.join(&rel);
@@ -2140,7 +2154,7 @@ fn agent_files_put_impl(
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
         "codex" => {
-            if forked {
+            if codex_snapshot_source.is_some_and(|source| source != pod_name) {
                 super::codex::reset_fork_identity(&home)?;
             }
         }

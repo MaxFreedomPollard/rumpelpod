@@ -122,6 +122,17 @@ fn codex_native_commands_manage_the_frontends_daemon() {
         "{stderr}"
     );
 
+    // An old host can resend its original auth/config after losing live state.
+    // The pod must retain native refreshes and local config edits on reconnect.
+    pod_command(&repo, &daemon)
+        .args(["enter", "test", "--", "sh", "-c", indoc! {r#"
+            set -eu
+            printf '{"auth_mode":"apikey","OPENAI_API_KEY":"sk-pod-owned-credentials"}' > "$HOME/.codex/auth.json"
+            printf '\n# pod-owned-config\n' >> "$HOME/.codex/config.toml"
+        "#}])
+        .success()
+        .expect("simulate native credential refresh and config edits");
+
     let output = pod_command(&repo, &daemon)
         .args([
             "enter",
@@ -160,6 +171,21 @@ fn codex_native_commands_manage_the_frontends_daemon() {
     resumed.wait_for_with_timeout("Full Access", Duration::from_secs(30));
     resumed.send("/exit");
     resumed.wait_for_exit();
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            indoc! {r#"
+            set -eu
+            grep sk-pod-owned-credentials "$HOME/.codex/auth.json"
+            grep pod-owned-config "$HOME/.codex/config.toml"
+        "#},
+        ])
+        .success()
+        .expect("host credential uploads preserve native-owned state");
 
     pod_command(&repo, &daemon)
         .args([

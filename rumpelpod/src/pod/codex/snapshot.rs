@@ -13,11 +13,25 @@ use anyhow::{Context, Result};
 use rusqlite::{backup::Backup, Connection, OpenFlags};
 use walkdir::WalkDir;
 
-pub(in crate::pod) fn archive<W: Write>(archive: &mut tar::Builder<W>, home: &Path) -> Result<()> {
+// Keep transfer provenance inside the opaque archive so the host needs no
+// Codex-specific fork/recreate protocol. This entry is consumed on restore.
+pub(in crate::pod) const SNAPSHOT_SOURCE_FILE: &str = ".codex/.rumpelpod-snapshot-source";
+
+pub(in crate::pod) fn archive<W: Write>(
+    archive: &mut tar::Builder<W>,
+    home: &Path,
+    pod_name: &str,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(pod_name.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    archive.append_data(&mut header, SNAPSHOT_SOURCE_FILE, pod_name.as_bytes())?;
     let codex_home = home.join(".codex");
     let entries = WalkDir::new(&codex_home).into_iter().filter_entry(|entry| {
         let rel = entry.path().strip_prefix(&codex_home).unwrap();
-        if rel.starts_with("app-server-control")
+        if entry.path() == home.join(SNAPSHOT_SOURCE_FILE)
+            || rel.starts_with("app-server-control")
             || rel.starts_with("packages/app-server-daemon/install.lock.d")
             || rel.starts_with(".tmp")
             || rel.starts_with("tmp")

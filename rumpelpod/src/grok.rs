@@ -148,7 +148,7 @@ fn write_grok_credentials(
             archive.into_inner().context("finalizing grok tar")?;
             Ok(())
         });
-        pod.put_agent_files("grok", read_end, None, false)
+        pod.put_agent_files("grok", read_end, None)
             .context("uploading grok credentials")?;
         handle
             .join()

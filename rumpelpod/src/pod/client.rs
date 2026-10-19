@@ -270,14 +270,8 @@ impl PodClient {
         agent: &str,
         reader: impl std::io::Read + Send + 'static,
         permission_hook: Option<bool>,
-        forked: bool,
     ) -> Result<()> {
-        crate::async_runtime::block_on(self.put_agent_files_async(
-            agent,
-            reader,
-            permission_hook,
-            forked,
-        ))
+        crate::async_runtime::block_on(self.put_agent_files_async(agent, reader, permission_hook))
     }
 
     pub async fn put_agent_files_async(
@@ -285,7 +279,6 @@ impl PodClient {
         agent: &str,
         reader: impl std::io::Read + Send + 'static,
         permission_hook: Option<bool>,
-        forked: bool,
     ) -> Result<()> {
         let gz_reader = GzEncoder::new(reader, Compression::fast());
         let body = reader_body(gz_reader);
@@ -298,8 +291,7 @@ impl PodClient {
             .put(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/x-tar")
-            .header("Content-Encoding", "gzip")
-            .query(&[("forked", forked)]);
+            .header("Content-Encoding", "gzip");
         if let Some(ph) = permission_hook {
             req = req.query(&[("permission_hook", if ph { "true" } else { "false" })]);
         }

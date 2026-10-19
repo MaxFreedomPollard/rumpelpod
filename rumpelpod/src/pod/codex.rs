@@ -9,7 +9,7 @@
 
 mod snapshot;
 
-pub(super) use snapshot::{archive as archive_state, reset_fork_identity};
+pub(super) use snapshot::{archive as archive_state, reset_fork_identity, SNAPSHOT_SOURCE_FILE};
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,7 +36,11 @@ use super::types::CodexState;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(120);
 // Keep activation outside agent snapshots: installing Codex or copying another
 // pod's history must not opt a pod into running a background daemon.
-pub(crate) const DAEMON_ENABLED_FILE: &str = "/opt/rumpelpod/codex-daemon-enabled";
+const DAEMON_ENABLED_FILE: &str = "/opt/rumpelpod/codex-daemon-enabled";
+
+// Unlike activation, initialized config follows conversations through forks and
+// recreation so native config edits are not replaced by launch defaults.
+const CONFIG_INITIALIZED_FILE: &str = ".codex/.rumpelpod-config-initialized";
 
 /// The rendezvous socket survives native restarts and package updates.
 pub type CodexAppServer = Arc<Mutex<Option<PathBuf>>>;
@@ -77,7 +81,7 @@ async fn handle_codex_proxy(
         }
     };
 
-    let socket_path = match start_daemon(&state, &repo_path).await {
+    let socket_path = match start_daemon(&state, &repo_path, Some(bypass)).await {
         Ok(socket_path) => socket_path,
         Err(e) => {
             eprintln!("codex: failed to start native daemon: {e:#}");
@@ -113,8 +117,15 @@ struct DaemonStartOutput {
 }
 
 /// Delegate reuse, stale PID recovery, and readiness checks to Codex itself.
-async fn start_daemon(state: &PodServerState, repo_path: &Path) -> Result<PathBuf> {
+async fn start_daemon(
+    state: &PodServerState,
+    repo_path: &Path,
+    bypass: Option<bool>,
+) -> Result<PathBuf> {
     let mut socket = state.codex_app_server.lock().await;
+    if let Some(bypass) = bypass {
+        initialize_config(&super::server::server_home()?, bypass)?;
+    }
     let output = tokio::time::timeout(
         DAEMON_START_TIMEOUT,
         Command::new(find_codex_cli()?)
@@ -159,9 +170,56 @@ pub async fn restore_daemon(state: &PodServerState, repo_path: &Path) -> Result<
         .try_exists()
         .context("checking whether rumpel codex enabled the native daemon")?
     {
-        start_daemon(state, repo_path).await?;
+        start_daemon(state, repo_path, None).await?;
     }
     Ok(())
+}
+
+/// Initial permission defaults come from the existing /codex?bypass request.
+/// Native startup ignores general -c flags, so both local and mobile clients
+/// must read these defaults from the pod's own config.
+fn initialize_config(home: &Path, bypass: bool) -> Result<()> {
+    let initialized = home.join(CONFIG_INITIALIZED_FILE);
+    if initialized
+        .try_exists()
+        .context("checking Codex config initialization")?
+    {
+        return Ok(());
+    }
+    let path = home.join(".codex/config.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("reading pod Codex config"),
+    };
+    let mut config = raw
+        .parse::<toml_edit::DocumentMut>()
+        .context("parsing pod Codex config")?;
+    if bypass {
+        config["approval_policy"] = toml_edit::value("never");
+        config["default_permissions"] = toml_edit::value(":danger-full-access");
+    }
+    std::fs::create_dir_all(home.join(".codex")).context("creating pod Codex home")?;
+    std::fs::write(path, config.to_string()).context("writing pod Codex permission defaults")?;
+    std::fs::write(initialized, b"").context("recording Codex config initialization")?;
+    Ok(())
+}
+
+/// The host may resend its original login whenever no live state is available.
+/// Once the pod owns a login, native refreshes, edits and logout must survive it.
+pub(super) fn preserve_credentials(home: &Path) -> Result<bool> {
+    for path in [
+        home.join(CONFIG_INITIALIZED_FILE),
+        home.join(".codex/auth.json"),
+    ] {
+        if path
+            .try_exists()
+            .context("checking pod Codex credentials")?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn connect_app_server(socket_path: &Path) -> Result<WebSocketStream<UnixStream>> {

@@ -2073,7 +2073,7 @@ fn copy_claude_config_via_pod(
         Ok(())
     });
 
-    pod.put_agent_files("claude", read_end, Some(permission_hook), false)
+    pod.put_agent_files("claude", read_end, Some(permission_hook))
         .context("uploading claude config")?;
     handle
         .join()
@@ -2126,7 +2126,7 @@ fn copy_pi_config_via_pod(pod: &PodClient, trust_workspace: bool) -> Result<()> 
         Ok(())
     });
 
-    pod.put_agent_files("pi", read_end, None, false)
+    pod.put_agent_files("pi", read_end, None)
         .context("uploading pi config")?;
     handle
         .join()
@@ -5063,7 +5063,7 @@ impl DaemonServer {
             agent_buffers.iter().map(|(agent, _)| *agent).collect();
         for (agent, buf) in agent_buffers {
             new_pod
-                .put_agent_files_async(agent, std::io::Cursor::new(buf), None, true)
+                .put_agent_files_async(agent, std::io::Cursor::new(buf), None)
                 .await
                 .with_context(|| format!("uploading {agent} state to new pod"))?;
         }
@@ -5229,7 +5229,7 @@ impl DaemonServer {
                     agent_snapshots.iter().map(|(agent, _)| *agent).collect();
                 for (agent, buf) in agent_snapshots {
                     new_pod
-                        .put_agent_files_async(agent, std::io::Cursor::new(buf), None, false)
+                        .put_agent_files_async(agent, std::io::Cursor::new(buf), None)
                         .await
                         .with_context(|| format!("restoring {agent} state to new k8s pod"))?;
                 }
@@ -5391,7 +5391,7 @@ impl DaemonServer {
                 agent_snapshots.iter().map(|(agent, _)| *agent).collect();
             for (agent, buf) in agent_snapshots {
                 new_pod
-                    .put_agent_files_async(agent, std::io::Cursor::new(buf), None, false)
+                    .put_agent_files_async(agent, std::io::Cursor::new(buf), None)
                     .await
                     .with_context(|| format!("restoring {agent} state"))?;
             }
