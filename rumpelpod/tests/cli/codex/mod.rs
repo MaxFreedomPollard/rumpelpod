@@ -7,6 +7,7 @@ mod common;
 mod detach;
 mod host_network;
 mod install;
+mod large_catalog;
 mod lifecycle;
 mod permissions;
 mod resume;
