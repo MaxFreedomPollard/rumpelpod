@@ -4,6 +4,8 @@
 //! Integration tests for the `rumpel codex` subcommand.
 
 mod common;
+mod compatibility;
+mod daemon;
 mod detach;
 mod host_network;
 mod install;

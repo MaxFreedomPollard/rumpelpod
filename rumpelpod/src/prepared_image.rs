@@ -17,7 +17,6 @@ use anyhow::{Context, Result};
 use indoc::{formatdoc, indoc};
 use nix::fcntl::{AtFlags, AT_FDCWD};
 use nix::unistd::{Gid, Uid};
-use semver::Version;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -31,9 +30,9 @@ use crate::CommandExt;
 const CLAUDE_CODE_DIST_BUCKET: &str =
     "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
 
-/// Bump this when the Dockerfile template changes in a way that
+/// Bump this when the Dockerfile template or provisioning changes in a way that
 /// invalidates previously built prepared images.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 13;
 
 /// File baked into the prepared image listing the container env var
 /// names the daemon resolved from `containerEnv` and `--env-file` at
@@ -1498,18 +1497,7 @@ fn install_claude_cli(version: &str) -> Result<()> {
 }
 
 fn install_codex_cli(version: &str) -> Result<()> {
-    let bin_path = Path::new(crate::daemon::CODEX_CONTAINER_BIN);
-    let host_path = Path::new(crate::daemon::CODEX_CODE_MODE_HOST_CONTAINER_BIN);
-    let needs_host = codex_needs_code_mode_host(version)?;
-    if codex_version_at(bin_path).as_deref() == Some(version)
-        && (!needs_host
-            || host_path.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            }))
-    {
-        return Ok(());
-    }
-
+    ensure_codex_daemon_ps()?;
     // The musl releases run independently of the devcontainer's libc.
     let target = match std::env::consts::ARCH {
         "x86_64" => "x86_64-unknown-linux-musl",
@@ -1517,90 +1505,121 @@ fn install_codex_cli(version: &str) -> Result<()> {
         other => return Err(anyhow::anyhow!("unsupported architecture '{other}'")),
     };
 
-    install_codex_release_binary(version, target, "codex", bin_path)?;
-    if needs_host {
-        install_codex_release_binary(version, target, "codex-code-mode-host", host_path)?;
+    let asset = format!("codex-package-{target}.tar.gz");
+    let url = format!("https://github.com/openai/codex/releases/download/rust-v{version}/{asset}");
+    let data = download_cli_asset(&url, "Codex package")?;
+
+    // Codex locates its manifest and bundled tools relative to the executable.
+    // Keep the complete package separate from rumpel's other binaries and state
+    // so Codex package discovery cannot include unrelated files.
+    let package_dir = Path::new("/opt/rumpelpod/codex");
+    fs::create_dir_all("/opt/rumpelpod").context("creating /opt/rumpelpod")?;
+    let staging = tempfile::tempdir_in("/opt/rumpelpod").context("staging Codex package")?;
+    let decoder = flate2::read::GzDecoder::new(&data[..]);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(staging.path())
+        .with_context(|| format!("extracting {asset}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(staging.path().join("codex-package.json"))
+            .context("reading Codex package manifest")?,
+    )
+    .context("parsing Codex package manifest")?;
+    if manifest["layoutVersion"] != 1
+        || manifest["version"] != version
+        || manifest["target"] != target
+        || manifest["variant"] != "codex"
+        || manifest["entrypoint"] != "bin/codex"
+        || manifest["resourcesDir"] != "codex-resources"
+        || manifest["pathDir"] != "codex-path"
+    {
+        return Err(anyhow::anyhow!(
+            "unexpected Codex package manifest for {version} ({target}): {manifest}"
+        ));
+    }
+    for executable in [
+        "bin/codex",
+        "bin/codex-code-mode-host",
+        "codex-path/rg",
+        "codex-resources/bwrap",
+    ] {
+        let metadata = fs::metadata(staging.path().join(executable))
+            .with_context(|| format!("checking Codex package executable {executable}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(anyhow::anyhow!(
+                "Codex package executable {executable} is not an executable file"
+            ));
+        }
     }
 
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o755))
+        .context("making Codex package accessible to pod users")?;
+    match fs::remove_dir_all(package_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("replacing Codex package"),
+    }
+    fs::rename(staging.path(), package_dir).context("installing Codex package")?;
+
+    fs::create_dir_all("/opt/rumpelpod/bin").context("creating /opt/rumpelpod/bin")?;
+    for (name, destination) in [
+        ("codex", crate::daemon::CODEX_CONTAINER_BIN),
+        (
+            "codex-code-mode-host",
+            crate::daemon::CODEX_CODE_MODE_HOST_CONTAINER_BIN,
+        ),
+    ] {
+        match fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("replacing {destination}")),
+        }
+        std::os::unix::fs::symlink(package_dir.join("bin").join(name), destination)
+            .with_context(|| format!("linking {destination} to Codex package"))?;
+    }
     Ok(())
 }
 
-/// Keep releases below rumpelpod's tested sidecar transition installable
-/// without assuming that their release has the companion asset.
-fn codex_needs_code_mode_host(version: &str) -> Result<bool> {
-    let version = Version::parse(version)
-        .with_context(|| format!("parsing Codex release version '{version}'"))?;
-    Ok(version >= Version::new(0, 147, 0))
+/// Native Codex uses ps to identify its detached processes. BusyBox ps lacks
+/// these options even though the musl Codex binary itself runs on Alpine.
+fn ensure_codex_daemon_ps() -> Result<()> {
+    if codex_daemon_ps_works()? {
+        return Ok(());
+    }
+    if crate::which("apt-get").is_some() {
+        run_pkg_install("apt-get", &[&["update"], &["install", "-y", "procps"]])?;
+    } else if crate::which("apk").is_some() {
+        run_pkg_install("apk", &[&["add", "--no-cache", "procps"]])?;
+    } else {
+        return Err(anyhow::anyhow!(
+            "Codex's native daemon requires procps ps; install procps (procps-ng on some distributions) in the devcontainer image"
+        ));
+    }
+    if !codex_daemon_ps_works()? {
+        return Err(anyhow::anyhow!(
+            "installed ps does not support Codex's native daemon"
+        ));
+    }
+    Ok(())
 }
 
-fn install_codex_release_binary(
-    version: &str,
-    target: &str,
-    binary: &str,
-    destination: &Path,
-) -> Result<()> {
-    let asset = format!("{binary}-{target}");
-    let url =
-        format!("https://github.com/openai/codex/releases/download/rust-v{version}/{asset}.tar.gz");
-    let label = format!("Codex {binary} tarball");
-    let data = download_cli_asset(&url, &label)?;
-
-    let decoder = flate2::read::GzDecoder::new(&data[..]);
-    let mut archive = tar::Archive::new(decoder);
-    let mut entries = archive.entries().context("reading Codex tar entries")?;
-    {
-        let mut entry = entries
-            .next()
-            .with_context(|| format!("empty Codex release asset {asset}.tar.gz"))?
-            .with_context(|| format!("reading {asset} tar entry"))?;
-        let entry_path = entry
-            .path()
-            .with_context(|| format!("reading path from {asset} tar entry"))?;
-        if entry_path != Path::new(&asset) || !entry.header().entry_type().is_file() {
-            return Err(anyhow::anyhow!(
-                "Codex release asset {asset}.tar.gz contained unexpected entry {entry_path:?}"
-            ));
-        }
-
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).context("creating /opt/rumpelpod/bin")?;
-        }
-        let destination_display = destination.display();
-        let mut output = fs::File::create(destination)
-            .with_context(|| format!("creating {destination_display}"))?;
-        std::io::copy(&mut entry, &mut output)
-            .with_context(|| format!("extracting {asset} to {destination_display}"))?;
-    }
-    match entries.next() {
-        None => {}
-        Some(Ok(_)) => {
-            return Err(anyhow::anyhow!(
-                "Codex release asset {asset}.tar.gz contained multiple entries"
-            ));
-        }
-        Some(Err(error)) => {
-            return Err(error).with_context(|| format!("reading {asset} tar entries"));
-        }
-    }
-
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).with_context(|| {
-        let destination = destination.display();
-        format!("making {destination} executable")
-    })
-}
-
-fn codex_version_at(bin: &Path) -> Option<String> {
-    let output = Command::new(bin)
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+fn codex_daemon_ps_works() -> Result<bool> {
+    let output = match Command::new("ps")
+        .args([
+            "-p",
+            &std::process::id().to_string(),
+            "-o",
+            "stat=",
+            "-o",
+            "lstart=",
+        ])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    Some(parse_codex_version(&raw)?.to_string())
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("checking ps for Codex's native daemon"),
+    };
+    Ok(output.status.success() && !output.stdout.is_empty())
 }
 
 /// Install the pi coding agent CLI at a specific version via npm.
@@ -1684,7 +1703,7 @@ fn ensure_node() -> Result<PathBuf> {
     // packaged node may still be too old, in which case we fall through
     // to the standalone download.
     if crate::which("apt-get").is_some() {
-        run_node_pkg_install(
+        run_pkg_install(
             "apt-get",
             &[&["update"], &["install", "-y", "nodejs", "npm"]],
         )?;
@@ -1692,7 +1711,7 @@ fn ensure_node() -> Result<PathBuf> {
             return Ok(dir);
         }
     } else if crate::which("apk").is_some() {
-        run_node_pkg_install("apk", &[&["add", "--no-cache", "nodejs", "npm"]])?;
+        run_pkg_install("apk", &[&["add", "--no-cache", "nodejs", "npm"]])?;
         if let Some(dir) = usable_node_bin_dir() {
             return Ok(dir);
         }
@@ -1703,12 +1722,12 @@ fn ensure_node() -> Result<PathBuf> {
 
 /// Run a sequence of package-manager invocations (e.g. apt-get update,
 /// then install).  Errors if any step fails.
-fn run_node_pkg_install(manager: &str, arg_sets: &[&[&str]]) -> Result<()> {
+fn run_pkg_install(manager: &str, arg_sets: &[&[&str]]) -> Result<()> {
     for args in arg_sets {
         let status = Command::new(manager)
             .args(*args)
             .status()
-            .with_context(|| format!("running {manager} to install Node.js"))?;
+            .with_context(|| format!("running {manager} to install agent dependencies"))?;
         if !status.success() {
             return Err(anyhow::anyhow!("{manager} {args:?} failed"));
         }

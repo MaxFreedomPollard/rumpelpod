@@ -15,7 +15,7 @@ fn codex_reconnects_after_delete_recreate_same_name() {
 
     {
         let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-        session.dismiss_dialogs();
+        session.wait_for_ready();
         session.send("What is the capital of France? Reply with just the city name, nothing else.");
         session.wait_for("Paris");
     }
@@ -26,7 +26,7 @@ fn codex_reconnects_after_delete_recreate_same_name() {
         .expect("delete should remove the first pod");
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs_with_timeout(Duration::from_secs(30));
+    session.wait_for_ready_with_timeout(Duration::from_secs(30));
     session.send_with_timeout(
         "What git remote has other pods? One word, all uppercase.",
         Duration::from_secs(30),

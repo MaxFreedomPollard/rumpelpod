@@ -1,0 +1,14 @@
+Adopt native Codex daemons from mbid/main
+
+Install complete Codex packages so bundled tools and resources remain
+discoverable, and use Codex 0.163 in prepared images and development
+tests.
+
+Let Codex manage its daemon over a Unix socket, restore activated pods
+on startup, and retain pod entry when daemon restoration fails. Preserve
+pod-owned credentials and permission settings across reconnects, and
+keep conversation snapshots consistent without cloning runtime state or
+remote control identities into forked pods.
+
+Keep the existing 128 MiB WebSocket limits across the native transport
+so large plugin catalogs continue to work after the daemon migration.

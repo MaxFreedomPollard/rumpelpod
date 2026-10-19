@@ -18,7 +18,7 @@ fn codex_pty_session_is_scoped_by_repo_and_pod() {
     let marker = "repo-one-unsubmitted-codex-marker";
 
     let mut first = CodexSession::spawn(&repo_one, &daemon, home.path(), &[]);
-    first.dismiss_dialogs();
+    first.wait_for_ready();
     first.write_raw(marker.as_bytes());
     first.wait_for(marker);
     first.write_raw(&[CTRL_A, b'd']);
