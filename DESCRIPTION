@@ -12,3 +12,6 @@ remote control identities into forked pods.
 
 Keep the existing 128 MiB WebSocket limits across the native transport
 so large plugin catalogs continue to work after the daemon migration.
+
+Adapt the large-catalog regression to the new Codex startup helper so
+the existing transport coverage remains runnable with Codex 0.163.

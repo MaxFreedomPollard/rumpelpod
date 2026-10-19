@@ -67,7 +67,7 @@ fn codex_large_plugin_catalog_stays_connected() {
         .expect("commit catalog fixture");
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    session.dismiss_dialogs_with_timeout(Duration::from_secs(30));
+    session.wait_for_ready_with_timeout(Duration::from_secs(30));
     let launch = launch_pod_via_daemon(&repo, &daemon, "test");
 
     let runtime = tokio::runtime::Runtime::new().expect("create WebSocket runtime");
