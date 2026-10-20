@@ -1,0 +1,13 @@
+Reclaim anonymous volumes when deleting pods
+
+Remove anonymous volumes with their containers so devcontainer mounts
+and image-defined volumes do not accumulate after deletion or
+recreation. Keep named volumes available for users who opt into
+persistent storage.
+
+Declare the development image's nested Docker and Podman stores with
+VOLUME so each container owns its storage and deletion can reclaim it.
+Leave image-volume handling on Kubernetes to the container runtime.
+
+Cover cleanup of both anonymous volume sources and preservation of an
+implicitly created named volume that overrides an image volume.
