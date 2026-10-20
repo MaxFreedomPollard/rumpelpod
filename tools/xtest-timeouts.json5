@@ -22,6 +22,8 @@
   "k8s::k8s_tunnel_reconnect": 3,
   "podman::podman_auto_fallback_and_explicit_engine_smoke": 3,
   "ssh::ssh_reconnect_test": 3,
+  // This opt-in diagnostic must outlast Codex's 120-second retry budget.
+  "ssh::reconnect::codex_frontend_stays_offline_after_ssh_recovers": 3,
 
   // 2x: Prepared-image installs, remaining k8s/compose/SSH reconnect cases.
   "claude::install::image_includes_claude_from_client_path": 2,

@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use indoc::formatdoc;
 
 use super::{write_ssh_config, SshRemoteHost};
+use crate::codex::common::{setup_controlled_home, CodexSession};
 use crate::common::{
     pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH,
 };
@@ -482,6 +483,146 @@ fn mux_git_syncs_after_remote_pause() {
         .expect("unpausing ssh host");
     let oid = commit_in_pod(&harness.remote, "alpha", "after-pause");
     wait_for_ref(harness.repo.path(), &pod_ref("alpha"), &oid);
+}
+
+/// Keep this diagnostic opt-in: it asserts the upstream failure rather than
+/// the recovery behavior rumpelpod should eventually provide.
+#[test]
+#[ignore = "reproduces Codex 0.163.0 exhausting its 120-second reconnect budget"]
+fn codex_frontend_stays_offline_after_ssh_recovers() {
+    if skip_if_unsupported() {
+        return;
+    }
+
+    let home = TestHome::new();
+    setup_controlled_home(&home);
+    home.link_local_bins(&["codex"]);
+    let remote = SshRemoteHost::start();
+    write_mux_ssh_config(&home, &remote);
+    let daemon =
+        TestDaemon::start_with_env(&home, &[("RUMPELPOD_HOST_PROBE_TIMEOUT_MS", FAST_PROBE_MS)]);
+    let repo = TestRepo::new();
+    write_test_devcontainer(&repo, "", "");
+    let config = serde_json::to_string(&serde_json::json!({"host": remote.ssh_spec()})).unwrap();
+    std::fs::write(repo.path().join(".rumpelpod.json"), config).unwrap();
+
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    session.wait_for_ready_with_timeout(Duration::from_secs(90));
+    session.send("What is the capital of France? Reply with just the city name, nothing else.");
+    session.wait_for_with_timeout("Paris", Duration::from_secs(45));
+    let draft = "draft-kept-through-ssh-outage";
+    session.write_raw(draft.as_bytes());
+    session.wait_for_with_timeout(draft, Duration::from_secs(10));
+    wait_for_mux(&home, &remote, MuxState::Alive, "mux before Codex outage");
+
+    // A short outage is the control: the same frontend can resume its thread
+    // and preserve a draft when transport recovery beats Codex's deadline.
+    let paused = PausedCodexHost::new(&remote);
+    wait_for_mux(&home, &remote, MuxState::Dead, "mux during short outage");
+    session.wait_for_with_timeout("Reconnecting to server", Duration::from_secs(30));
+    paused.resume();
+    session.wait_for_absent_with_timeout("Reconnecting to server", Duration::from_secs(60));
+    session.wait_for_with_timeout(draft, Duration::from_secs(15));
+    assert!(!session.screen().contents().contains("Reconnect failed"));
+    eprintln!("The original Codex frontend recovered from the short SSH outage");
+    wait_for_mux(&home, &remote, MuxState::Alive, "mux before long outage");
+
+    let outage = Instant::now();
+    let paused = PausedCodexHost::new(&remote);
+    wait_for_mux(&home, &remote, MuxState::Dead, "mux during long outage");
+    session.wait_for_with_timeout("Reconnecting to server", Duration::from_secs(30));
+    session.wait_for_with_timeout(
+        "Automatic reconnect could not restore",
+        Duration::from_secs(150),
+    );
+    assert!(
+        outage.elapsed() >= Duration::from_secs(110),
+        "Codex failed before its retry budget could have elapsed"
+    );
+    eprintln!(
+        "Codex gave up after {:?} with the frontend still alive",
+        outage.elapsed()
+    );
+    assert!(session.screen().contents().contains(draft));
+
+    paused.resume();
+    let oid = commit_in_pod(
+        &remote,
+        "test",
+        "prove transport recovered after Codex gave up",
+    );
+    wait_for_ref(repo.path(), &pod_ref("test"), &oid);
+    let stdout = pod_command(&repo, &daemon)
+        .args(["enter", "test", "--", "echo", "transport-recovered"])
+        .success()
+        .expect("enter pod after SSH recovery");
+    assert_eq!(
+        String::from_utf8_lossy(&stdout).trim(),
+        "transport-recovered"
+    );
+
+    // Fresh keystrokes force a redraw after transport recovery. Detaching and
+    // reattaching must expose the stale frontend instead of silently replacing it.
+    session.write_raw(b"-after-recovery");
+    session.wait_for_with_timeout("-after-recovery", Duration::from_secs(10));
+    assert!(session.screen().contents().contains("Reconnect failed"));
+    session.write_raw(&[0x01, b'd']);
+    session.wait_for_exit();
+    let mut reattached = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    reattached.wait_for_with_timeout("Reconnect failed", Duration::from_secs(10));
+    assert!(reattached.screen().contents().contains(draft));
+
+    // Quitting the local frontend leaves the remote conversation available.
+    // A replacement can resume it without replaying the submitted prompt.
+    reattached.write_raw(&[0x03]);
+    reattached.write_raw(&[0x03]);
+    reattached.wait_for_exit();
+    let mut replacement = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    replacement.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    replacement.send_with_timeout("/status", Duration::from_secs(10));
+    replacement.wait_for_with_timeout("Permissions:", Duration::from_secs(15));
+    eprintln!("A replacement frontend resumed the conversation after SSH recovery");
+}
+
+// Restore connectivity before TestDaemon's cleanup contacts the remote host,
+// including when a diagnostic assertion panics during an outage.
+struct PausedCodexHost<'a> {
+    remote: &'a SshRemoteHost,
+    paused: bool,
+}
+
+impl<'a> PausedCodexHost<'a> {
+    fn new(remote: &'a SshRemoteHost) -> Self {
+        Command::new("docker")
+            .args(["pause", &remote.container_id])
+            .success()
+            .expect("pause SSH host");
+        Self {
+            remote,
+            paused: true,
+        }
+    }
+
+    fn resume(mut self) {
+        Command::new("docker")
+            .args(["unpause", &self.remote.container_id])
+            .success()
+            .expect("restore SSH host");
+        self.paused = false;
+    }
+}
+
+impl Drop for PausedCodexHost<'_> {
+    fn drop(&mut self) {
+        if self.paused {
+            if let Err(error) = Command::new("docker")
+                .args(["unpause", &self.remote.container_id])
+                .success()
+            {
+                eprintln!("restoring SSH host after failed Codex diagnostic: {error:#}");
+            }
+        }
+    }
 }
 
 /// Ten pods on one muxed host, then a client-side disconnect. Every
