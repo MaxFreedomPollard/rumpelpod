@@ -592,17 +592,27 @@ fn check_codex_frontend_recovery(detach_before_recovery: bool) {
     // Observe replacement before attaching again: detached sessions must
     // recover without an incoming client driving their lifecycle.
     let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
+    let replacement_pid = loop {
         let pids = codex_frontend_pids(&daemon);
         if pids.len() == 1 && pids != original_pid {
-            break;
+            break pids[0];
         }
         assert!(
             Instant::now() < deadline,
             "exhausted Codex frontend was not replaced"
         );
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
+    let command = Command::new("ps")
+        .args(["-ww", "-p", &replacement_pid.to_string(), "-o", "args="])
+        .success()
+        .expect("read replacement frontend command");
+    let command = String::from_utf8(command).expect("frontend command is UTF-8");
+    let args: Vec<_> = command.split_whitespace().collect();
+    assert!(
+        args.windows(2).any(|args| args == ["resume", "--last"]),
+        "recovery should let Codex choose the last thread: {command}"
+    );
     if detach_before_recovery {
         session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     }

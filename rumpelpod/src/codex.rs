@@ -16,10 +16,9 @@
 //!     landing on the welcome screen. A replacement frontend resumes the last
 //!     remote thread, while the first frontend starts a new one.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -191,7 +190,6 @@ async fn codex_ws_handler(
                         q.codex_cli_path.as_deref(),
                         q.no_dangerously_bypass_approvals_and_sandbox,
                         extra_args,
-                        None,
                     )
                 })
             },
@@ -207,7 +205,6 @@ fn build_codex_spec(
     codex_bin: Option<&std::path::Path>,
     no_dangerously_bypass_approvals_and_sandbox: bool,
     extra_args: Vec<String>,
-    resume_thread: Option<&str>,
 ) -> Result<Option<SessionSpec>> {
     let Some((container_url, container_token, codex_state)) =
         daemon.connected_codex_pod(repo_path, pod_name)
@@ -251,11 +248,10 @@ fn build_codex_spec(
         "--remote-auth-token-env".to_string(),
         CODEX_PROXY_TOKEN_ENV.to_string(),
     ];
-    // Manual attachment can fall back to a new thread when history is empty.
-    // Recovery uses the observed thread so another client's work cannot redirect
-    // the replacement frontend to a more recently updated conversation.
+    // Let Codex choose the latest remote thread, or start one when history is
+    // empty, without interpreting the frontend's protocol traffic.
     cmd.push("resume".to_string());
-    cmd.push(resume_thread.unwrap_or("--last").to_string());
+    cmd.push("--last".to_string());
     cmd.extend(extra_args);
 
     let recovery = FrontendRecovery {
@@ -264,7 +260,6 @@ fn build_codex_spec(
         pod_name: pod_name.to_string(),
         codex_bin: codex_bin.to_path_buf(),
         no_dangerously_bypass_approvals_and_sandbox,
-        thread: proxy.thread,
     };
     Ok(Some(SessionSpec {
         name: codex_session_name(repo_path, pod_name),
@@ -287,7 +282,6 @@ struct FrontendRecovery {
     pod_name: String,
     codex_bin: PathBuf,
     no_dangerously_bypass_approvals_and_sandbox: bool,
-    thread: Arc<Mutex<Option<String>>>,
 }
 
 impl FrontendRecovery {
@@ -318,7 +312,6 @@ impl FrontendRecovery {
                 // can initialize a frontend. Probe without starting a thread.
                 match probe_app_server(&url, &token).await {
                     Ok(()) => {
-                        let thread = self.thread.lock().unwrap().clone();
                         if watch
                             .replace(|| {
                                 tokio::task::block_in_place(|| {
@@ -331,7 +324,6 @@ impl FrontendRecovery {
                                         Some(&self.codex_bin),
                                         self.no_dangerously_bypass_approvals_and_sandbox,
                                         Vec::new(),
-                                        thread.as_deref(),
                                     )
                                 })
                             })
@@ -504,14 +496,12 @@ pub(crate) fn codex_websocket_config() -> tungstenite::protocol::WebSocketConfig
 ///
 /// `ready_tx` fires once the accept loop is running so callers know
 /// the proxy is actually processing connections (not just bound).
-#[allow(clippy::too_many_arguments)]
 pub async fn run_codex_proxy(
     listener: tokio::net::TcpListener,
     container_url: String,
     container_token: String,
     client_token: String,
     bypass: Arc<AtomicBool>,
-    thread: Arc<Mutex<Option<String>>>,
     ready_tx: std::sync::mpsc::SyncSender<()>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -533,17 +523,9 @@ pub async fn run_codex_proxy(
         let container_token = container_token.clone();
         let client_token = client_token.clone();
         let bypass = bypass.load(Ordering::Relaxed);
-        let thread = thread.clone();
         tokio::spawn(async move {
-            if let Err(e) = proxy_connection(
-                stream,
-                &url,
-                &container_token,
-                &client_token,
-                bypass,
-                thread,
-            )
-            .await
+            if let Err(e) =
+                proxy_connection(stream, &url, &container_token, &client_token, bypass).await
             {
                 eprintln!("codex proxy: connection error: {e:#}");
             }
@@ -557,7 +539,6 @@ async fn proxy_connection(
     container_token: &str,
     client_token: &str,
     bypass: bool,
-    thread: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
     let expected_auth = format!("Bearer {client_token}");
     let client_ws = tokio_tungstenite::accept_hdr_async_with_config(
@@ -595,7 +576,6 @@ async fn proxy_connection(
 
     let (mut client_write, mut client_read) = client_ws.split();
     let (mut server_write, mut server_read) = server_ws.split();
-    let mut thread_requests = HashSet::new();
 
     loop {
         tokio::select! {
@@ -603,12 +583,6 @@ async fn proxy_connection(
                 match msg {
                     Some(msg) => {
                         let msg = msg.context("reading WebSocket from codex TUI")?;
-                        if let tungstenite::Message::Text(text) = &msg {
-                            let request: Value = serde_json::from_str(text)?;
-                            if matches!(request["method"].as_str(), Some("thread/start" | "thread/resume" | "thread/fork")) {
-                                thread_requests.insert(request["id"].to_string());
-                            }
-                        }
                         server_write.send(msg).await.context("forwarding WebSocket to pod /codex")?;
                     }
                     None => break,
@@ -618,19 +592,6 @@ async fn proxy_connection(
                 match msg {
                     Some(msg) => {
                         let msg = msg.context("reading WebSocket from pod /codex")?;
-                        if let tungstenite::Message::Text(text) = &msg {
-                            if !thread_requests.is_empty() {
-                                let response: Value = serde_json::from_str(text)?;
-                                if let Some(id) = response.get("id").filter(|_| response.get("result").is_some() || response.get("error").is_some()) {
-                                    if thread_requests.remove(&id.to_string()) && response.get("error").is_none() {
-                                        let id = response["result"]["thread"]["id"]
-                                            .as_str()
-                                            .context("Codex thread response is missing its ID")?;
-                                        *thread.lock().unwrap() = Some(id.to_string());
-                                    }
-                                }
-                            }
-                        }
                         client_write.send(msg).await.context("forwarding WebSocket to codex TUI")?;
                     }
                     None => break,

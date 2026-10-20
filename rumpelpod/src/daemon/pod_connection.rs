@@ -633,7 +633,7 @@ impl PodConnection {
         container_token: String,
         bypass: bool,
     ) -> Result<CodexProxyEndpoint> {
-        let thread = {
+        {
             let resources = self.resources.lock().unwrap();
             if let Some(handle) = resources.codex_proxy.as_ref() {
                 // A replacement frontend may choose different startup defaults.
@@ -645,16 +645,10 @@ impl PodConnection {
                     return Ok(CodexProxyEndpoint {
                         port: handle.port,
                         token: handle.token.clone(),
-                        thread: handle.thread.clone(),
                     });
                 }
             }
-            resources
-                .codex_proxy
-                .as_ref()
-                .map(|handle| handle.thread.clone())
-                .unwrap_or_default()
-        };
+        }
 
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").context("binding codex proxy listener")?;
@@ -676,7 +670,6 @@ impl PodConnection {
             container_token.clone(),
             token.clone(),
             Arc::clone(&bypass),
-            Arc::clone(&thread),
             ready_tx,
             cancel_rx,
         ));
@@ -690,15 +683,10 @@ impl PodConnection {
             bypass,
             container_url,
             container_token,
-            thread: thread.clone(),
             _cancel_tx: cancel_tx,
         });
 
-        Ok(CodexProxyEndpoint {
-            port,
-            token,
-            thread,
-        })
+        Ok(CodexProxyEndpoint { port, token })
     }
 
     pub fn notify_host_connected(&self) {
