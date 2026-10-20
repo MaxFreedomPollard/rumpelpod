@@ -1,0 +1,16 @@
+Allow terminal prompts on the exec connection
+
+Allow rumpel exec -t/--tty to run programs that need a controlling
+terminal, including SSH password prompts, without another container exec
+or a terminal setup roundtrip. Keep enter behavior unchanged.
+
+Carry terminal dimensions and TERM in the initial request, and forward
+resizes over the exec stream. Restore local terminal settings after
+completion or errors. Combine terminal stdout and stderr, preserving
+the existing pipe behavior for exec without --tty.
+
+Forward external signals to foreground terminal jobs and clean up the
+session's job groups when the client disconnects.
+
+Cover password echo suppression, single-byte input, resize, Ctrl-C,
+Ctrl-D, exit status, cleanup, and reuse of the existing pod connection.

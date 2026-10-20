@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use indoc::{formatdoc, indoc};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rumpelpod::daemon::protocol::{ClientContext, ConnectPodRequest, Daemon, DaemonClient};
 use rumpelpod::CommandExt;
 
@@ -160,6 +162,373 @@ fn exec_streams_binary_input_and_output_before_stdin_eof() {
     assert_eq!(output.stderr, expected);
 }
 
+struct ExecTerminal {
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    output: Vec<u8>,
+    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+impl ExecTerminal {
+    fn spawn(repo: &TestRepo, daemon: &TestDaemon, args: &[&str]) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 31,
+                cols: 97,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("rumpel");
+        command.env_clear();
+        command.env("HOME", &daemon.home_path);
+        command.env("PATH", &daemon.bin_dir);
+        command.env("RUMPELPOD_DAEMON_SOCKET", &daemon.socket_path);
+        command.env("TERM", "xterm");
+        command.cwd(repo.path());
+        command.args(args);
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || loop {
+            let mut buffer = vec![0; 4096];
+            let result = match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => {
+                    buffer.truncate(count);
+                    Ok(buffer)
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
+                Err(error) => Err(error),
+            };
+            let failed = result.is_err();
+            if tx.send(result).is_err() || failed {
+                return;
+            }
+        });
+        Self {
+            master: pair.master,
+            child,
+            writer,
+            output: Vec::new(),
+            rx,
+        }
+    }
+
+    fn wait_for(&mut self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !String::from_utf8_lossy(&self.output).contains(marker) {
+            let bytes = self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for {marker:?}: {error}; output: {:?}",
+                        String::from_utf8_lossy(&self.output)
+                    )
+                })
+                .unwrap();
+            self.output.extend(bytes);
+        }
+    }
+
+    fn wait(&mut self) -> portable_pty::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exec client did not exit: {:?}",
+                String::from_utf8_lossy(&self.output)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ExecTerminal {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    eprintln!("killing exec test client: {error}");
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("reaping exec test client: {error}");
+                }
+            }
+            Err(error) => eprintln!("checking exec test client: {error}"),
+        }
+    }
+}
+
+#[test]
+fn exec_tty_supports_password_prompts_resize_and_control_keys() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "--tty",
+            "test",
+            "--",
+            "bash",
+            "-c",
+            indoc! {r#"
+                set -eu
+                test -t 0 && test -t 1 && test -t 2
+                exec 3<>/dev/tty
+                stty -echo <&3
+                printf 'Password: ' >&3
+                IFS= read -r password <&3
+                test "$password" = 'terminal-secret'
+                printf '\naccepted\n'
+                printf 'TERM=%s\n' "$TERM"
+                stty size <&3
+                stty -icanon min 1 time 0 <&3
+                printf 'byte-ready\n'
+                byte=$(dd bs=1 count=1 status=none <&3)
+                test "$byte" = x
+                stty icanon <&3
+                trap 'stty size <&3; printf "resized\n"' WINCH
+                trap 'printf "interrupted\n"; exit 37' INT
+                printf 'signal-ready\n'
+                while :; do sleep 0.05; done
+            "#},
+        ],
+    );
+    terminal.wait_for("Password: ");
+    terminal.writer.write_all(b"terminal-secret\n").unwrap();
+    terminal.wait_for("byte-ready");
+    assert!(
+        !String::from_utf8_lossy(&terminal.output).contains("terminal-secret"),
+        "password echoed by the client or pod terminal"
+    );
+    assert!(String::from_utf8_lossy(&terminal.output).contains("TERM=xterm"));
+    assert!(String::from_utf8_lossy(&terminal.output).contains("31 97"));
+    // No newline: this reaches the pod only if the client uses raw input.
+    terminal.writer.write_all(b"x").unwrap();
+    terminal.wait_for("signal-ready");
+    terminal
+        .master
+        .resize(PtySize {
+            rows: 45,
+            cols: 111,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    terminal.wait_for("resized");
+    assert!(String::from_utf8_lossy(&terminal.output).contains("45 111"));
+    terminal.writer.write_all(b"\x03").unwrap();
+    terminal.wait_for("interrupted");
+    assert_eq!(terminal.wait().exit_code(), 37);
+    let restored = terminal.master.get_termios().unwrap();
+    assert_eq!(
+        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
+        libc::ECHO | libc::ICANON
+    );
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "stty -echo; printf 'eof-ready\\n'; cat; printf 'eof-complete\\n'",
+        ],
+    );
+    terminal.wait_for("eof-ready");
+    terminal.writer.write_all(b"terminal-input\n\x04").unwrap();
+    terminal.wait_for("eof-complete");
+    assert!(String::from_utf8_lossy(&terminal.output).contains("terminal-input"));
+    assert!(terminal.wait().success());
+}
+
+#[test]
+fn exec_tty_restores_terminal_after_startup_failure() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let daemon = TestDaemon::start(&home);
+    let mut terminal =
+        ExecTerminal::spawn(&repo, &daemon, &["exec", "-t", "missing", "--", "true"]);
+    terminal.wait_for("not found");
+    assert!(!terminal.wait().success());
+    let restored = terminal.master.get_termios().unwrap();
+    assert_eq!(
+        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
+        libc::ECHO | libc::ICANON
+    );
+}
+
+#[test]
+fn exec_tty_merges_output_and_exits_while_stdin_is_open() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut child = pod_command(&repo, &daemon)
+        .args([
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2 || exit 1; printf 'out\\n'; printf 'err\\n' >&2; exit 42",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let output = child.wait_with_output().unwrap();
+    drop(stdin);
+    assert_eq!(output.status.code(), Some(42));
+    assert_eq!(output.stdout, b"out\r\nerr\r\n");
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn exec_tty_forwards_external_signals_to_foreground_jobs() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "bash",
+            "--norc",
+            "-ic",
+            "sh -c 'printf foreground-ready; exec sleep 60'",
+        ],
+    );
+    terminal.wait_for("foreground-ready");
+    let pid = Pid::from_raw(terminal.child.process_id().unwrap() as i32);
+    kill(pid, Signal::SIGINT).unwrap();
+    assert_eq!(terminal.wait().exit_code(), 130);
+    let restored = terminal.master.get_termios().unwrap();
+    assert_eq!(
+        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
+        libc::ECHO | libc::ICANON
+    );
+}
+
+#[test]
+fn exec_tty_disconnect_terminates_background_jobs() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "bash",
+            "--norc",
+            "-ic",
+            "sleep 60 & printf '%s\\n' \"$!\" > /tmp/exec-tty-job; printf job-ready; wait",
+        ],
+    );
+    terminal.wait_for("job-ready");
+    let output = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "cat", "/tmp/exec-tty-job"])
+        .success()
+        .unwrap();
+    let pid = String::from_utf8(output).unwrap().trim().to_string();
+    kill(
+        Pid::from_raw(terminal.child.process_id().unwrap() as i32),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    terminal.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = pod_command(&repo, &daemon)
+            .args([
+                "exec",
+                "test",
+                "--",
+                "sh",
+                "-c",
+                indoc! {r#"
+                    if ! kill -0 "$1" 2>/dev/null; then exit 0; fi
+                    grep -q '^State:.*Z' "/proc/$1/status"
+                "#},
+                "sh",
+                &pid,
+            ])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal background job survived client disconnect: {:?}",
+            output.stderr
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn exec_reuses_connected_transport_for_first_and_concurrent_commands() {
     let repo = TestRepo::new();
@@ -210,10 +579,18 @@ fn exec_reuses_connected_transport_for_first_and_concurrent_commands() {
     .unwrap();
     let started = Instant::now();
     pod_command(&repo, &daemon)
-        .args(["exec", "test", "--", "true"])
+        .args([
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2",
+        ])
         .success()
         .unwrap();
-    eprintln!("First connected exec true: {:?}", started.elapsed());
+    eprintln!("First connected terminal exec: {:?}", started.elapsed());
 
     let mut waiting = pod_command(&repo, &daemon)
         .args(["exec", "test", "--", "cat"])

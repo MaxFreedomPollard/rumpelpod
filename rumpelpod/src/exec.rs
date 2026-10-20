@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
+use std::env::VarError;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use axum::Router;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -25,9 +26,10 @@ use crate::async_runtime::block_on;
 use crate::cli::ExecCommand;
 use crate::daemon::protocol::{ClientContext, ConnectPodRequest};
 use crate::daemon::{self, DaemonServer};
+use crate::exec_pty::RawTerminal;
 use crate::exec_stream::{
-    self, ExecSignal, ExecSpec, ExecutionId, Frame, SignalRequest, CHUNK_SIZE, CONTENT_TYPE,
-    UNKNOWN_OUTCOME,
+    self, ExecSignal, ExecSpec, ExecutionId, Frame, SignalRequest, TerminalSize, TerminalSpec,
+    CHUNK_SIZE, CONTENT_TYPE, UNKNOWN_OUTCOME,
 };
 use crate::git::get_repo_root;
 
@@ -38,6 +40,23 @@ struct ExecRequest {
 }
 
 pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
+    let interactive = command.tty && io::stdin().is_terminal();
+    let terminal = if command.tty {
+        Some(TerminalSpec {
+            size: if interactive {
+                TerminalSize::from_stdin()?
+            } else {
+                TerminalSize { rows: 24, cols: 80 }
+            },
+            term: match std::env::var("TERM") {
+                Ok(term) => Some(term),
+                Err(VarError::NotPresent) => None,
+                Err(error @ VarError::NotUnicode(_)) => return Err(error.into()),
+            },
+        })
+    } else {
+        None
+    };
     let repo_path = get_repo_root()?;
     let relative_workdir = std::env::current_dir()?
         .strip_prefix(&repo_path)
@@ -53,26 +72,32 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
             id: ExecutionId(rand::random()),
             command: command.command.clone(),
             relative_workdir,
+            terminal,
         },
     };
     let initial = exec_stream::encode_request(&request)?;
     let socket = daemon::socket_path()?;
     block_on(async {
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        let window_change = if interactive {
+            Some(signal(SignalKind::window_change())?)
+        } else {
+            None
+        };
         let client = exec_stream::client_builder().unix_socket(socket).build()?;
         let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
         tx.send(Ok(initial)).await.context("sending exec request")?;
 
         let stdin_tx = tx;
         let _stdin = AbortOnDropHandle::new(tokio::spawn(async move {
-            if let Err(error) = forward_stdin(&stdin_tx).await {
+            if let Err(error) = forward_stdin(&stdin_tx, window_change).await {
                 if let Err(send_error) = stdin_tx.send(Err(error)).await {
                     log::debug!("exec input closed after stdin error: {send_error}");
                 }
             }
         }));
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
         let send = client
             .post("http://localhost/pod/exec")
             .header("content-type", CONTENT_TYPE)
@@ -89,6 +114,13 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
             let error = response.text().await.context(UNKNOWN_OUTCOME)?;
             return Err(anyhow::anyhow!("exec failed ({status}): {error}"));
         }
+        // Keep local Ctrl-C available during startup. Switch before displaying
+        // any prompt so password input cannot be echoed by the local terminal.
+        let _terminal = if interactive {
+            Some(RawTerminal::new()?)
+        } else {
+            None
+        };
         // Headers acknowledge that the execution ID has been registered. A
         // separate, bodyless HTTP/2 request bypasses both stream and connection
         // DATA flow control when the command stops consuming stdin.
@@ -142,7 +174,7 @@ async fn read_output(response: reqwest::Response) -> Result<u8> {
             }
             Some(Frame::Exit(code)) => return Ok(code),
             Some(Frame::Error(error)) => return Err(anyhow::anyhow!("{error}")),
-            Some(Frame::Stdin(_) | Frame::StdinEof) => {
+            Some(Frame::Stdin(_) | Frame::StdinEof | Frame::Resize(_)) => {
                 return Err(anyhow::anyhow!("invalid exec response; {UNKNOWN_OUTCOME}"));
             }
             None => return Err(anyhow::anyhow!("{UNKNOWN_OUTCOME}")),
@@ -150,17 +182,31 @@ async fn read_output(response: reqwest::Response) -> Result<u8> {
     }
 }
 
-async fn forward_stdin(tx: &mpsc::Sender<io::Result<Vec<u8>>>) -> io::Result<()> {
+async fn forward_stdin(
+    tx: &mpsc::Sender<io::Result<Vec<u8>>>,
+    mut window_change: Option<Signal>,
+) -> io::Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = vec![0; CHUNK_SIZE];
     loop {
-        let count = stdin.read(&mut buffer).await?;
-        let frame = if count == 0 {
-            Frame::StdinEof
-        } else {
-            Frame::Stdin(buffer[..count].to_vec())
+        let frame = tokio::select! {
+            count = stdin.read(&mut buffer) => {
+                let count = count?;
+                if count == 0 {
+                    Frame::StdinEof
+                } else {
+                    Frame::Stdin(buffer[..count].to_vec())
+                }
+            }
+            _ = async {
+                match &mut window_change {
+                    Some(signal) => signal.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => Frame::Resize(TerminalSize::from_stdin().map_err(exec_stream::io_error)?),
         };
-        if tx.send(Ok(frame.encode())).await.is_err() || count == 0 {
+        let eof = matches!(frame, Frame::StdinEof);
+        if tx.send(Ok(frame.encode())).await.is_err() || eof {
             return Ok(());
         }
     }

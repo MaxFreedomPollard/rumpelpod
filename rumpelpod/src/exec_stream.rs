@@ -26,6 +26,19 @@ pub(crate) struct ExecSpec {
     pub id: ExecutionId,
     pub command: Vec<String>,
     pub relative_workdir: PathBuf,
+    pub terminal: Option<TerminalSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TerminalSpec {
+    pub size: TerminalSize,
+    pub term: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,6 +82,7 @@ pub(crate) enum Frame {
     Stderr(Vec<u8>),
     Exit(u8),
     Error(String),
+    Resize(TerminalSize),
 }
 
 impl Frame {
@@ -80,6 +94,11 @@ impl Frame {
             Self::Stderr(data) => (4, data),
             Self::Exit(code) => (5, vec![code]),
             Self::Error(error) => (6, error.into_bytes()),
+            Self::Resize(size) => {
+                let mut payload = size.rows.to_be_bytes().to_vec();
+                payload.extend_from_slice(&size.cols.to_be_bytes());
+                (7, payload)
+            }
         };
         let mut bytes = Vec::with_capacity(5 + payload.len());
         bytes.push(tag);
@@ -102,6 +121,10 @@ pub(crate) async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<
         (4, _) => Frame::Stderr(payload),
         (5, [code]) => Frame::Exit(*code),
         (6, _) => Frame::Error(String::from_utf8(payload).context("exec error is not UTF-8")?),
+        (7, [row_hi, row_lo, col_hi, col_lo]) => Frame::Resize(TerminalSize {
+            rows: u16::from_be_bytes([*row_hi, *row_lo]),
+            cols: u16::from_be_bytes([*col_hi, *col_lo]),
+        }),
         (tag, _) => return Err(anyhow::anyhow!("invalid exec frame {tag}")),
     };
     Ok(Some(frame))
