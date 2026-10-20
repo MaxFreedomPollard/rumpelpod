@@ -14,10 +14,13 @@ use git2::Repository;
 use indoc::{formatdoc, indoc};
 use rumpelpod::config::{ContainerEngine, Host};
 use rumpelpod::daemon::db::{self, PodId, PodStatus};
-use serde_json::json;
+use rumpelpod::CommandExt;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
+use crate::common::{
+    pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo, TEST_USER,
+};
 use crate::executor::{executor_mode, skip_test, ExecutorMode, ExecutorResources};
 
 // Populate local state without provisioning infrastructure that the test
@@ -497,6 +500,120 @@ fn delete_smoke_test() {
         "rumpel delete failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn delete_removes_anonymous_volumes_and_preserves_named() {
+    let engine = match executor_mode() {
+        ExecutorMode::Docker => "docker",
+        ExecutorMode::Podman => "podman",
+        ExecutorMode::Ssh | ExecutorMode::K8s => {
+            skip_test();
+            return;
+        }
+    };
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    let repo_id = repo.path().file_name().unwrap().to_str().unwrap();
+    let named_volume = format!("delete-named-{repo_id}");
+    write_test_devcontainer(
+        &repo,
+        &formatdoc! {r#"
+            RUN mkdir /image-volume /named-volume \
+                && chown {TEST_USER}:{TEST_USER} /image-volume /named-volume
+            VOLUME ["/image-volume", "/named-volume"]
+        "#},
+        &formatdoc! {r#"
+            ,"mounts": [
+                {{"type": "volume", "target": "/mount-volume"}},
+                {{"type": "volume", "source": "{named_volume}", "target": "/named-volume"}}
+            ]
+        "#},
+    );
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "delete-volumes",
+            "--",
+            "sh",
+            "-c",
+            indoc! {"
+                echo image > /image-volume/sentinel &&
+                echo mount > /mount-volume/sentinel &&
+                echo named > /named-volume/sentinel
+            "},
+        ])
+        .success()
+        .expect("write data into all three volumes");
+    let repo_path = repo.path().display();
+    let containers = Command::new(engine)
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=dev.rumpelpod.repo_path={repo_path}"),
+            "--filter",
+            "label=dev.rumpelpod.name=delete-volumes",
+        ])
+        .success()
+        .expect("find pod container");
+    let containers = String::from_utf8(containers).unwrap();
+    assert_eq!(containers.lines().count(), 1, "expected one pod container");
+    let mounts = Command::new(engine)
+        .args(["inspect", "--format", "{{json .Mounts}}", containers.trim()])
+        .success()
+        .expect("inspect container mounts");
+    let mounts: Vec<Value> = serde_json::from_slice(&mounts).unwrap();
+    let anonymous_volumes: Vec<String> = ["/image-volume", "/mount-volume"]
+        .iter()
+        .map(|target| {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount["Destination"] == *target)
+                .expect("anonymous volume is mounted");
+            assert_eq!(mount["Type"], "volume");
+            let name = mount["Name"].as_str().expect("volume has a name");
+            assert!(!name.is_empty());
+            name.to_string()
+        })
+        .collect();
+    let named_mount = mounts
+        .iter()
+        .find(|mount| mount["Destination"] == "/named-volume")
+        .expect("named volume overrides the image volume");
+    assert_eq!(named_mount["Name"], named_volume);
+
+    pod_command(&repo, &daemon)
+        .args(["delete", "--wait", "delete-volumes"])
+        .success()
+        .expect("delete pod and its anonymous volumes");
+
+    let remaining = Command::new(engine)
+        .args(["volume", "ls", "--quiet"])
+        .success()
+        .expect("list remaining volumes");
+    let remaining = String::from_utf8(remaining).unwrap();
+    for volume in anonymous_volumes {
+        assert!(
+            !remaining.lines().any(|name| name == volume),
+            "anonymous volume survived pod deletion: {volume}"
+        );
+    }
+    // Naming storage opts into persistence even when the engine creates
+    // it implicitly and the image also declares a volume at that path.
+    assert!(
+        remaining.lines().any(|name| name == named_volume),
+        "named volume must survive pod deletion"
+    );
+    Command::new(engine)
+        .args(["volume", "rm", &named_volume])
+        .success()
+        .expect("clean up the retained named volume");
 }
 
 #[test]

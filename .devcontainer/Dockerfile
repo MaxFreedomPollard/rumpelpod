@@ -56,11 +56,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
 
 # Use Podman's rootful API service rather than rootless mode; rootless
 # user namespaces are not available in every environment this image runs
-# in (e.g. plain runc build containers). devcontainer.json mounts a
-# dedicated volume at /var/lib/containers; without it, Podman's rootful
-# storage would sit on the pod's own overlay root, where the kernel
-# refuses nested overlayfs. Host networking avoids /dev/net/tun during
-# Dockerfile RUN steps.
+# in (e.g. plain runc build containers). Host networking avoids
+# /dev/net/tun during Dockerfile RUN steps.
 RUN mkdir -p \
         /etc/containers \
         /etc/systemd/system/podman.socket.d \
@@ -362,5 +359,10 @@ ENV XDG_RUNTIME_DIR=/run/user/${USER_ID}
 ENV DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
 ENV RUMPELPOD_DEVCONTAINER=1
 ENV RUMPELPOD_TEST_SYSTEMD=1
+
+# Nested engines need storage outside the container's overlay root to
+# use native overlayfs. Anonymous volumes isolate their stores per
+# container and allow deletion to reclaim the nested images and caches.
+VOLUME ["/var/lib/containers", "/var/lib/docker"]
 
 ENTRYPOINT ["/usr/local/bin/devcontainer-entrypoint.sh"]

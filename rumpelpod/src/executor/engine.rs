@@ -589,7 +589,7 @@ fn docker_exit_code(status: ExitStatus) -> i32 {
 async fn docker_delete(backend: &DockerBackend, id: &str) -> Result<()> {
     let mut command = backend.command();
     let output = command
-        .args(["rm", "-f", id])
+        .args(["rm", "-f", "-v", id])
         .output_async()
         .await
         .context("running docker rm")?;

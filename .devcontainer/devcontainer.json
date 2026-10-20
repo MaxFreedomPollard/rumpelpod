@@ -15,24 +15,6 @@
             "type": "bind",
             "source": "${localWorkspaceFolder}/cloud",
             "target": "${containerWorkspaceFolder}/cloud"
-        },
-        // Nested container storage must not live on the pod's own
-        // overlayfs root: the kernel refuses overlay-upon-overlay, so
-        // podman/docker would degrade to fuse-overlayfs or vfs. Sysbox
-        // used to shadow /var/lib/docker with a host directory
-        // automatically; under plain runc both engines need an explicit
-        // volume to get the native overlay driver. devcontainerId keys
-        // the volumes per pod (concurrent engines must not share a
-        // store) while staying stable across recreation of a pod.
-        {
-            "type": "volume",
-            "source": "rumpelpod-podman-storage-${devcontainerId}",
-            "target": "/var/lib/containers"
-        },
-        {
-            "type": "volume",
-            "source": "rumpelpod-docker-storage-${devcontainerId}",
-            "target": "/var/lib/docker"
         }
     ]
 }
