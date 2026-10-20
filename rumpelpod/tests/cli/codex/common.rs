@@ -176,6 +176,10 @@ impl CodexSession {
 
     /// Block until `needle` appears in the rendered terminal screen.
     pub fn wait_for(&mut self, needle: &str) -> String {
+        let contents = self.parser.screen().contents();
+        if contents.contains(needle) {
+            return contents;
+        }
         let mut last_dump = Instant::now();
 
         loop {
@@ -228,16 +232,25 @@ impl CodexSession {
     /// Restart tests use this so connection failures surface before
     /// xtest kills the whole test process.
     pub fn wait_for_with_timeout(&mut self, needle: &str, timeout: Duration) -> String {
-        self.wait_for_screen(needle, timeout, |contents| contents.contains(needle))
+        // A preceding wait may have consumed the update containing this text.
+        // An idle TUI need not emit more bytes to wake the receiver.
+        let contents = self.parser.screen().contents();
+        if contents.contains(needle) {
+            return contents;
+        }
+        self.wait_for_screen_update(needle, timeout, |contents| contents.contains(needle))
     }
 
     pub fn wait_for_absent_with_timeout(&mut self, needle: &str, timeout: Duration) {
-        self.wait_for_screen(&format!("{needle:?} to disappear"), timeout, |contents| {
+        if !self.parser.screen().contents().contains(needle) {
+            return;
+        }
+        self.wait_for_screen_update(&format!("{needle:?} to disappear"), timeout, |contents| {
             !contents.contains(needle)
         });
     }
 
-    fn wait_for_screen(
+    fn wait_for_screen_update(
         &mut self,
         needle: &str,
         timeout: Duration,
@@ -318,7 +331,7 @@ impl CodexSession {
             deadline.saturating_duration_since(Instant::now()),
         );
         loop {
-            let contents = self.wait_for_screen(
+            let contents = self.wait_for_screen_update(
                 "startup status response",
                 deadline.saturating_duration_since(Instant::now()),
                 |contents| {

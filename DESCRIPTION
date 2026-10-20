@@ -1,9 +1,16 @@
-Give intermittent CI tests more chances
+Avoid false failures in CI terminal tests
+
+Check the current Codex screen before waiting for more terminal output.
+CI timed out waiting for text that a previous wait had already consumed;
+an idle TUI need not produce another update. Preserve the startup loop's
+need for fresh output after submitting Enter. A regression test covers
+presence and absence waits whose conditions are already satisfied.
 
 Allow three retries per failed test in the Linux CI pipeline, while
 retaining xtest's ten-retry suite budget to limit the cost of widespread
 failures. Keep the local default at one retry for faster feedback.
 
-The v0.13.0 commit passed its tag pipeline but failed the main pipeline,
-which suggests an intermittent failure. Retrying individual tests avoids
-paying for another full build when a transient failure can recover.
+Inspected CI logs show repeated Claude exit failures and recoverable
+Kubernetes and SSH flakes, without exhausting the shared retry budget.
+Keep these tests enabled while their underlying causes are investigated.
+Track the remaining flakes in NVIDIA/rumpelpod#9, #10 and #11.
