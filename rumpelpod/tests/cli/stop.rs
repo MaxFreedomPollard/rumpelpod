@@ -6,6 +6,8 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
+use rumpelpod::daemon::protocol::DaemonClient;
+use rumpelpod::daemon::reconnect::ReconnectEvent;
 use rumpelpod::CommandExt;
 use rusqlite::Connection;
 
@@ -182,9 +184,6 @@ fn stop_multiple_continues_past_unknown() {
 /// forever.
 #[test]
 fn stop_sends_reconnect_stopped_event() {
-    use rumpelpod::daemon::protocol::DaemonClient;
-    use rumpelpod::daemon::reconnect::ReconnectEvent;
-
     if !executor_supports_stop() {
         return;
     }
@@ -213,16 +212,23 @@ fn stop_sends_reconnect_stopped_event() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let client = DaemonClient::new_unix(&socket_path);
-        let stream = client
-            .pod_reconnect_events(&repo_path, pod_name)
-            .expect("pod_reconnect_events failed");
-        for event in stream {
-            let event = event.expect("error reading reconnect event");
-            let done = matches!(event, ReconnectEvent::Stopped);
-            let _ = tx.send(event);
-            if done {
-                break;
+        loop {
+            let stream = client
+                .pod_reconnect_events(&repo_path, pod_name)
+                .expect("pod_reconnect_events failed");
+            let mut connected = false;
+            for event in stream {
+                let event = event.expect("error reading reconnect event");
+                connected |= matches!(event, ReconnectEvent::Connected);
+                let done = matches!(event, ReconnectEvent::Stopped);
+                tx.send(event).expect("stop test receiver disappeared");
+                if done {
+                    return;
+                }
             }
+            // Connected normally ends a reconnect attempt. An initial greeting
+            // can race this subscription, so subscribe again to observe stop.
+            assert!(connected, "reconnect stream ended without a terminal event");
         }
     });
 
@@ -237,9 +243,8 @@ fn stop_sends_reconnect_stopped_event() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The event loop may publish an initial or in-flight recovery event
-    // after this subscriber attaches. The stop contract is that the
-    // stream eventually terminates with Stopped.
+    // A subscription after stop must also observe Stopped, so ending and
+    // reopening an initial Connected attempt cannot lose the notification.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -256,9 +261,6 @@ fn stop_sends_reconnect_stopped_event() {
 /// events must immediately return a Stopped event (no active listener).
 #[test]
 fn stop_reconnect_after_stop() {
-    use rumpelpod::daemon::protocol::DaemonClient;
-    use rumpelpod::daemon::reconnect::ReconnectEvent;
-
     if !executor_supports_stop() {
         return;
     }
