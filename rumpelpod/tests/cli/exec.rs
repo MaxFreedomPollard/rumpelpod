@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -168,10 +169,16 @@ struct ExecTerminal {
     writer: Box<dyn Write + Send>,
     output: Vec<u8>,
     rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+    parser: vt100::Parser,
+    original_termios: libc::termios,
 }
 
 impl ExecTerminal {
     fn spawn(repo: &TestRepo, daemon: &TestDaemon, args: &[&str]) -> Self {
+        Self::spawn_local(repo, daemon, "rumpel", args)
+    }
+
+    fn spawn_local(repo: &TestRepo, daemon: &TestDaemon, program: &str, args: &[&str]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 31,
@@ -180,7 +187,8 @@ impl ExecTerminal {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new("rumpel");
+        let original_termios = Self::attributes(&*pair.master);
+        let mut command = CommandBuilder::new(program);
         command.env_clear();
         command.env("HOME", &daemon.home_path);
         command.env("PATH", &daemon.bin_dir);
@@ -215,6 +223,8 @@ impl ExecTerminal {
             writer,
             output: Vec::new(),
             rx,
+            parser: vt100::Parser::new(31, 97, 200),
+            original_termios,
         }
     }
 
@@ -231,15 +241,93 @@ impl ExecTerminal {
                     )
                 })
                 .unwrap();
+            self.parser.process(&bytes);
             self.output.extend(bytes);
         }
+    }
+
+    fn wait_for_screen(&mut self, description: &str, predicate: impl Fn(&vt100::Screen) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !predicate(self.parser.screen()) {
+            let bytes = self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for {description}: {error}; screen: {:?}",
+                        self.parser.screen().contents()
+                    )
+                })
+                .unwrap();
+            self.parser.process(&bytes);
+            self.output.extend(bytes);
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+    }
+
+    fn assert_restored(&self) {
+        let restored = Self::attributes(&*self.master);
+        assert_eq!(restored.c_iflag, self.original_termios.c_iflag);
+        assert_eq!(restored.c_oflag, self.original_termios.c_oflag);
+        assert_eq!(restored.c_cflag, self.original_termios.c_cflag);
+        assert_eq!(restored.c_lflag, self.original_termios.c_lflag);
+        assert_eq!(restored.c_cc, self.original_termios.c_cc);
+        // SAFETY: both snapshots are initialized termios values.
+        unsafe {
+            assert_eq!(
+                libc::cfgetispeed(&restored),
+                libc::cfgetispeed(&self.original_termios)
+            );
+            assert_eq!(
+                libc::cfgetospeed(&restored),
+                libc::cfgetospeed(&self.original_termios)
+            );
+        }
+    }
+
+    fn attributes(master: &dyn MasterPty) -> libc::termios {
+        // Some libc implementations leave unused termios slots untouched.
+        // Initialize those slots so snapshot comparisons have stable values.
+        let mut attributes = MaybeUninit::<libc::termios>::zeroed();
+        // SAFETY: master owns the descriptor and attributes has enough space.
+        let result =
+            unsafe { libc::tcgetattr(master.as_raw_fd().unwrap(), attributes.as_mut_ptr()) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        // SAFETY: the buffer was initialized and tcgetattr succeeded.
+        unsafe { attributes.assume_init() }
     }
 
     fn wait(&mut self) -> portable_pty::ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
+                loop {
+                    match self
+                        .rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(bytes) => {
+                            let bytes = bytes.unwrap();
+                            self.parser.process(&bytes);
+                            self.output.extend(bytes);
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return status,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            panic!("exec terminal output remained open after client exit")
+                        }
+                    }
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -327,25 +415,13 @@ fn exec_tty_supports_password_prompts_resize_and_control_keys() {
     // No newline: this reaches the pod only if the client uses raw input.
     terminal.writer.write_all(b"x").unwrap();
     terminal.wait_for("signal-ready");
-    terminal
-        .master
-        .resize(PtySize {
-            rows: 45,
-            cols: 111,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
+    terminal.resize(45, 111);
     terminal.wait_for("resized");
     assert!(String::from_utf8_lossy(&terminal.output).contains("45 111"));
     terminal.writer.write_all(b"\x03").unwrap();
     terminal.wait_for("interrupted");
     assert_eq!(terminal.wait().exit_code(), 37);
-    let restored = terminal.master.get_termios().unwrap();
-    assert_eq!(
-        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
-        libc::ECHO | libc::ICANON
-    );
+    terminal.assert_restored();
 
     let mut terminal = ExecTerminal::spawn(
         &repo,
@@ -368,6 +444,288 @@ fn exec_tty_supports_password_prompts_resize_and_control_keys() {
 }
 
 #[test]
+fn exec_tty_preserves_scrollback_and_wraps_at_the_local_terminal_width() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "bash",
+            "-c",
+            indoc! {r#"
+                for ((line=1; line<=80; line++)); do
+                    printf 'line-%04d\n' "$line"
+                done
+                printf '%100sEND\n' '' | tr ' ' x
+            "#},
+        ],
+    );
+    assert!(terminal.wait().success());
+    let screen = terminal.parser.screen();
+    assert!(screen.contents().contains("line-0080"));
+    assert!(!screen.contents().contains("line-0001"));
+    assert_eq!(screen.rows(0, 97).nth(28).unwrap(), "x".repeat(97));
+    assert_eq!(screen.rows(0, 97).nth(29).unwrap(), "xxxEND");
+    terminal.parser.screen_mut().set_scrollback(200);
+    assert!(terminal
+        .parser
+        .screen()
+        .contents()
+        .starts_with("line-0001\n"));
+    terminal.assert_restored();
+}
+
+#[test]
+fn exec_tty_pager_scrolls_with_keys_and_mouse_and_redraws_after_resize() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "RUN apk add --no-cache less", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "bash",
+            "-c",
+            indoc! {r#"
+                set -eu
+                for ((line=1; line<=200; line++)); do
+                    printf 'line-%04d\n' "$line"
+                done > /tmp/exec-pager-lines
+                printf 'before-pager\n'
+                less --mouse -P pager-ready /tmp/exec-pager-lines
+                printf 'after-pager\n'
+            "#},
+        ],
+    );
+    terminal.wait_for_screen("the first pager page", |screen| {
+        screen.alternate_screen()
+            && screen.contents().starts_with("line-0001\n")
+            && screen.contents().contains("pager-ready")
+    });
+    assert!(!terminal.parser.screen().contents().contains("line-0040"));
+
+    terminal.writer.write_all(b"\x1b[6~").unwrap();
+    terminal.wait_for_screen("PageDown to advance the pager", |screen| {
+        !screen.contents().contains("line-0001")
+            && screen.contents().contains("line-0040")
+            && screen.contents().contains("pager-ready")
+    });
+    terminal.writer.write_all(b"\x1b[5~").unwrap();
+    terminal.wait_for_screen("PageUp to return to the first page", |screen| {
+        screen.contents().starts_with("line-0001\n") && screen.contents().contains("pager-ready")
+    });
+
+    terminal.writer.write_all(b"\x1b[<65;10;10M").unwrap();
+    terminal.wait_for_screen("the mouse wheel to scroll down", |screen| {
+        !screen.contents().contains("line-0001") && screen.contents().contains("pager-ready")
+    });
+    terminal.writer.write_all(b"\x1b[<64;10;10M").unwrap();
+    terminal.wait_for_screen("the mouse wheel to scroll back up", |screen| {
+        screen.contents().starts_with("line-0001\n") && screen.contents().contains("pager-ready")
+    });
+
+    terminal.resize(45, 111);
+    terminal.wait_for_screen("the pager to fill the taller terminal", |screen| {
+        screen.contents().starts_with("line-0001\n")
+            && screen.contents().contains("line-0040")
+            && screen.rows(0, 111).nth(44).unwrap().contains("pager-ready")
+    });
+    terminal.writer.write_all(b"q").unwrap();
+    assert!(terminal.wait().success());
+    let screen = terminal.parser.screen();
+    assert!(!screen.alternate_screen());
+    assert!(screen.contents().contains("before-pager"));
+    assert!(screen.contents().contains("after-pager"));
+    assert!(!screen.contents().contains("line-0040"));
+    assert_eq!(screen.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+    terminal.assert_restored();
+}
+
+#[test]
+fn exec_tty_uses_stdout_dimensions_and_resizes_after_stdin_eof() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    for redirect_stdin in ["exec rumpel \"$@\" </dev/null", "printf '' | rumpel \"$@\""] {
+        let mut terminal = ExecTerminal::spawn_local(
+            &repo,
+            &daemon,
+            "sh",
+            &[
+                "-c",
+                redirect_stdin,
+                "sh",
+                "exec",
+                "-t",
+                "test",
+                "--",
+                "bash",
+                "-c",
+                indoc! {r#"
+                    set -eu
+                    trap 'printf "resized="; stty size; exit 0' WINCH
+                    printf 'initial='
+                    stty size
+                    printf 'resize-ready\n'
+                    while :; do sleep 0.05; done
+                "#},
+            ],
+        );
+        terminal.wait_for("resize-ready");
+        assert!(
+            String::from_utf8_lossy(&terminal.output).contains("initial=31 97"),
+            "{redirect_stdin}: {:?}",
+            String::from_utf8_lossy(&terminal.output)
+        );
+        terminal.resize(45, 111);
+        terminal.wait_for("resized=45 111");
+        assert!(terminal.wait().success());
+        terminal.assert_restored();
+    }
+}
+
+#[test]
+fn exec_tty_resizes_while_large_piped_input_is_blocked() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn_local(
+        &repo,
+        &daemon,
+        "sh",
+        &[
+            "-c",
+            indoc! {r#"
+                (
+                    while ! test -e "$HOME/send-exec-input"; do sleep 0.01; done
+                    head -c 16777216 /dev/zero
+                ) | rumpel "$@"
+            "#},
+            "sh",
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "bash",
+            "-c",
+            indoc! {r#"
+                set -eu
+                stty raw -echo
+                trap 'printf "resized="; stty size; exit 0' WINCH
+                printf 'blocked-input-ready\n'
+                while :; do sleep 0.05; done
+            "#},
+        ],
+    );
+    terminal.wait_for("blocked-input-ready");
+    fs::write(home.path().join("send-exec-input"), "").unwrap();
+    // The input exceeds the pipe, PTY, and HTTP/2 stream windows. No pod
+    // process reads it, so a resize sharing that data stream cannot advance.
+    thread::sleep(Duration::from_millis(500));
+    let resized = Instant::now();
+    terminal.resize(45, 111);
+    terminal.wait_for("resized=45 111");
+    assert!(
+        resized.elapsed() < Duration::from_secs(5),
+        "terminal resize waited for blocked stdin"
+    );
+    let status = terminal.wait();
+    assert!(
+        status.success(),
+        "{status:?}: {:?}",
+        String::from_utf8_lossy(&terminal.output)
+    );
+    terminal.assert_restored();
+}
+
+#[test]
+fn exec_tty_restores_terminal_after_the_running_connection_fails() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            indoc! {r#"
+                stty -echo
+                printf 'connection-failure-ready\n'
+                read -r proceed
+                kill -KILL "$PPID"
+            "#},
+        ],
+    );
+    terminal.wait_for("connection-failure-ready");
+    let raw = terminal.master.get_termios().unwrap();
+    assert_eq!(raw.local_flags.bits() & (libc::ECHO | libc::ICANON), 0);
+    terminal.writer.write_all(b"continue\n").unwrap();
+    assert!(!terminal.wait().success());
+    assert!(String::from_utf8_lossy(&terminal.output).contains("outcome is unknown"));
+    terminal.assert_restored();
+}
+
+#[test]
 fn exec_tty_restores_terminal_after_startup_failure() {
     let repo = TestRepo::new();
     let home = TestHome::new();
@@ -376,11 +734,7 @@ fn exec_tty_restores_terminal_after_startup_failure() {
         ExecTerminal::spawn(&repo, &daemon, &["exec", "-t", "missing", "--", "true"]);
     terminal.wait_for("not found");
     assert!(!terminal.wait().success());
-    let restored = terminal.master.get_termios().unwrap();
-    assert_eq!(
-        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
-        libc::ECHO | libc::ICANON
-    );
+    terminal.assert_restored();
 }
 
 #[test]
@@ -452,11 +806,7 @@ fn exec_tty_forwards_external_signals_to_foreground_jobs() {
     let pid = Pid::from_raw(terminal.child.process_id().unwrap() as i32);
     kill(pid, Signal::SIGINT).unwrap();
     assert_eq!(terminal.wait().exit_code(), 130);
-    let restored = terminal.master.get_termios().unwrap();
-    assert_eq!(
-        restored.local_flags.bits() & (libc::ECHO | libc::ICANON),
-        libc::ECHO | libc::ICANON
-    );
+    terminal.assert_restored();
 }
 
 #[test]

@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use nix::pty::{openpty, Winsize};
+#[cfg(target_os = "linux")]
+use nix::fcntl::OFlag;
+use nix::pty::Winsize;
+#[cfg(target_os = "linux")]
+use nix::pty::{grantpt, posix_openpt, unlockpt};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use nix::unistd::{read, setsid, tcgetpgrp, write, Pid};
 use tokio::io::unix::AsyncFd;
@@ -42,15 +47,15 @@ impl Drop for RawTerminal {
 }
 
 impl TerminalSize {
-    pub fn from_stdin() -> Result<Self> {
+    pub(crate) fn from_fd(fd: RawFd) -> Result<Self> {
         let mut size = Winsize {
             ws_row: 0,
             ws_col: 0,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: stdin is a live descriptor and size is writable for the ioctl.
-        if unsafe { libc::ioctl(io::stdin().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == -1 {
+        // SAFETY: size is writable for the ioctl; invalid descriptors return an error.
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == -1 {
             return Err(io::Error::last_os_error()).context("reading terminal size");
         }
         Ok(Self {
@@ -71,21 +76,47 @@ impl TerminalSize {
 
 pub(crate) struct Pty(AsyncFd<OwnedFd>);
 
+fn allocate_terminal() -> Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        // Atomic CLOEXEC prevents concurrent spawns from inheriting a slave
+        // that delays EOF or a master that keeps a disconnected session alive.
+        let master =
+            posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+                .context("allocating exec terminal master")?;
+        grantpt(&master).context("granting exec terminal access")?;
+        unlockpt(&master).context("unlocking exec terminal slave")?;
+        // SAFETY: master is a live PTY descriptor. TIOCGPTPEER takes flags and
+        // returns a new descriptor without reading or writing userspace memory.
+        let slave = unsafe {
+            libc::ioctl(
+                master.as_raw_fd(),
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if slave == -1 {
+            return Err(io::Error::last_os_error()).context("allocating exec terminal slave");
+        }
+        // SAFETY: a successful TIOCGPTPEER returns a new owned descriptor.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        Ok((master.into(), slave))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(anyhow::anyhow!("terminal exec requires a Linux pod server"))
+    }
+}
+
 impl Pty {
     pub fn prepare(command: &mut Command, terminal: &TerminalSpec) -> Result<Self> {
-        let pair = openpty(&terminal.size.winsize(), None).context("allocating exec terminal")?;
-        // A leaked slave keeps output open after the command exits. A leaked
-        // master keeps the terminal alive after its client disconnects.
-        for fd in [&pair.master, &pair.slave] {
-            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
-        }
-        let flags = OFlag::from_bits_retain(fcntl(&pair.master, FcntlArg::F_GETFL)?);
-        fcntl(&pair.master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-        let master = AsyncFd::new(pair.master)?;
+        let (master, slave) = allocate_terminal()?;
+        let master = Self(AsyncFd::new(master)?);
+        master.resize(terminal.size)?;
         command
-            .stdin(Stdio::from(pair.slave.try_clone()?))
-            .stdout(Stdio::from(pair.slave.try_clone()?))
-            .stderr(Stdio::from(pair.slave));
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
         if let Some(term) = &terminal.term {
             command.env("TERM", term);
         }
@@ -102,7 +133,7 @@ impl Pty {
                 Ok(())
             });
         }
-        Ok(Self(master))
+        Ok(master)
     }
 
     pub fn resize(&self, size: TerminalSize) -> Result<()> {
@@ -136,12 +167,18 @@ impl Pty {
 
     pub async fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
-            let count = self
-                .0
-                .async_io(Interest::WRITABLE, |fd| {
-                    write(fd, data).map_err(io::Error::from)
-                })
-                .await?;
+            let mut ready = self.0.writable().await?;
+            // A hung-up PTY with a full input buffer can keep returning EAGAIN.
+            // Closed readiness stays set, so retrying it would spin forever
+            // and prevent the command's final output and exit from being read.
+            if ready.ready().is_write_closed() {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let count = match ready.try_io(|fd| write(fd.get_ref(), data).map_err(io::Error::from))
+            {
+                Ok(result) => result?,
+                Err(_) => continue,
+            };
             if count == 0 {
                 return Err(io::ErrorKind::WriteZero.into());
             }

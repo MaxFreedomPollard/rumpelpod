@@ -27,10 +27,16 @@ use super::server::PodServerState;
 use crate::async_command::ProcessGroup;
 use crate::exec_pty::{Pty, TerminalSession};
 use crate::exec_stream::{
-    self, ExecSignal, ExecSpec, ExecutionId, Frame, SignalRequest, CHUNK_SIZE, CONTENT_TYPE,
+    self, ExecSignal, ExecSpec, ExecutionId, Frame, ResizeRequest, SignalRequest, TerminalSize,
+    CHUNK_SIZE, CONTENT_TYPE,
 };
 
-pub(crate) type Executions = Arc<Mutex<HashMap<ExecutionId, mpsc::Sender<Signal>>>>;
+pub(crate) type Executions = Arc<Mutex<HashMap<ExecutionId, mpsc::Sender<Control>>>>;
+
+pub(crate) enum Control {
+    Signal(Signal),
+    Resize(TerminalSize),
+}
 
 struct RegisteredExecution {
     executions: Executions,
@@ -54,12 +60,31 @@ pub(super) async fn signal_handler(
     };
     let sender = state.executions.lock().unwrap().get(&request.id).cloned();
     if let Some(sender) = sender {
-        if let Err(error) = sender.send(signal).await {
+        if let Err(error) = sender.send(Control::Signal(signal)).await {
             log::debug!("exec finished before signal delivery: {error}");
         }
     }
     // The command can finish between the client sending a signal and its
     // arrival. Execution IDs keep that race from signaling a reused PID.
+    StatusCode::NO_CONTENT
+}
+
+pub(super) async fn resize_handler(
+    State(state): State<PodServerState>,
+    Query(request): Query<ResizeRequest>,
+) -> StatusCode {
+    let sender = state.executions.lock().unwrap().get(&request.id).cloned();
+    if let Some(sender) = sender {
+        if let Err(error) = sender
+            .send(Control::Resize(TerminalSize {
+                rows: request.rows,
+                cols: request.cols,
+            }))
+            .await
+        {
+            log::debug!("exec finished before resize delivery: {error}");
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -132,8 +157,8 @@ pub(super) async fn exec_handler(
     // Command retains the configured slave descriptors after spawn.
     // Release them so PTY EOF follows the last child closing its terminal.
     drop(command);
-    let (signal_tx, signals) = mpsc::channel(4);
-    executions.insert(spec.id, signal_tx);
+    let (control_tx, controls) = mpsc::channel(4);
+    executions.insert(spec.id, control_tx);
     drop(executions);
     let registration = RegisteredExecution {
         executions: state.executions,
@@ -141,7 +166,8 @@ pub(super) async fn exec_handler(
     };
     let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
     tokio::spawn(async move {
-        if let Err(error) = run_process(child, reader, &tx, signals, registration, terminal).await {
+        if let Err(error) = run_process(child, reader, &tx, controls, registration, terminal).await
+        {
             if let Err(send_error) = tx
                 .send(Ok(Frame::Error(format!("{error:#}")).encode()))
                 .await
@@ -160,7 +186,7 @@ async fn run_process(
     mut child: Child,
     reader: impl AsyncRead + Unpin,
     tx: &mpsc::Sender<io::Result<Vec<u8>>>,
-    mut signals: mpsc::Receiver<Signal>,
+    mut controls: mpsc::Receiver<Control>,
     registration: RegisteredExecution,
     terminal: Option<Pty>,
 ) -> Result<()> {
@@ -197,15 +223,25 @@ async fn run_process(
             result = &mut input => {
                 return result.context("exec input failed; command outcome is unknown");
             }
-            Some(signal) = signals.recv() => {
-                if let Some(terminal) = &terminal {
-                    if let Some(foreground) = terminal.foreground_group()? {
-                        if foreground != pid {
-                            forward_signal(foreground, signal)?;
+            Some(control) = controls.recv() => {
+                match control {
+                    Control::Signal(signal) => {
+                        if let Some(terminal) = &terminal {
+                            if let Some(foreground) = terminal.foreground_group()? {
+                                if foreground != pid {
+                                    forward_signal(foreground, signal)?;
+                                }
+                            }
                         }
+                        forward_signal(pid, signal)?;
+                    }
+                    Control::Resize(size) => {
+                        terminal
+                            .as_ref()
+                            .context("terminal resize for exec without a terminal")?
+                            .resize(size)?;
                     }
                 }
-                forward_signal(pid, signal)?;
             }
             _ = tx.closed() => {
                 return Err(anyhow::anyhow!("exec client disconnected; terminating command"));
@@ -277,11 +313,6 @@ async fn forward_input(
                 // A PTY cannot be half-closed. Leave it alive for output;
                 // terminal EOF is the caller's Ctrl-D byte, not transport EOF.
                 stdin = None;
-            }
-            Some(Frame::Resize(size)) => {
-                terminal
-                    .context("terminal resize for exec without a terminal")?
-                    .resize(size)?;
             }
             Some(Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) | Frame::Error(_)) => {
                 return Err(anyhow::anyhow!("invalid exec input frame"));

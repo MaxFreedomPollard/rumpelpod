@@ -233,6 +233,7 @@ pub fn run_container_server(
         .route("/init-mounts", post(init_mounts_handler))
         .route("/exec", post(super::exec::exec_handler))
         .route("/exec/signal", post(super::exec::signal_handler))
+        .route("/exec/resize", post(super::exec::resize_handler))
         .route("/events", get(events_handler))
         .route("/env", get(env_handler))
         .route("/container-env", get(container_env_handler))

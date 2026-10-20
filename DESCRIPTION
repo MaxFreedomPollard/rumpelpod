@@ -5,12 +5,19 @@ terminal, including SSH password prompts, without another container exec
 or a terminal setup roundtrip. Keep enter behavior unchanged.
 
 Carry terminal dimensions and TERM in the initial request, and forward
-resizes over the exec stream. Restore local terminal settings after
-completion or errors. Combine terminal stdout and stderr, preserving
-the existing pipe behavior for exec without --tty.
+resizes independently of stdin so a blocked paste cannot stall redraws.
+Use the local input or output terminal for size and resize events.
+Restore local terminal settings after completion or errors. Combine
+terminal stdout and stderr, preserving pipe behavior without --tty.
 
 Forward external signals to foreground terminal jobs and clean up the
 session's job groups when the client disconnects.
+Allocate descriptors with atomic close-on-exec to keep concurrent
+commands from inheriting each other's terminals.
+Handle terminal hangup during blocked input so completed commands can
+still deliver their output and exit status.
 
 Cover password echo suppression, single-byte input, resize, Ctrl-C,
 Ctrl-D, exit status, cleanup, and reuse of the existing pod connection.
+Exercise scrollback and a real pager, including local dimensions with
+redirected input and resizing while input is blocked.

@@ -16,7 +16,7 @@ use axum::Router;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -28,8 +28,8 @@ use crate::daemon::protocol::{ClientContext, ConnectPodRequest};
 use crate::daemon::{self, DaemonServer};
 use crate::exec_pty::RawTerminal;
 use crate::exec_stream::{
-    self, ExecSignal, ExecSpec, ExecutionId, Frame, SignalRequest, TerminalSize, TerminalSpec,
-    CHUNK_SIZE, CONTENT_TYPE, UNKNOWN_OUTCOME,
+    self, ExecSignal, ExecSpec, ExecutionId, Frame, ResizeRequest, SignalRequest, TerminalSize,
+    TerminalSpec, CHUNK_SIZE, CONTENT_TYPE, UNKNOWN_OUTCOME,
 };
 use crate::git::get_repo_root;
 
@@ -41,19 +41,14 @@ struct ExecRequest {
 
 pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
     let interactive = command.tty && io::stdin().is_terminal();
-    let terminal = if command.tty {
-        Some(TerminalSpec {
-            size: if interactive {
-                TerminalSize::from_stdin()?
-            } else {
-                TerminalSize { rows: 24, cols: 80 }
-            },
-            term: match std::env::var("TERM") {
-                Ok(term) => Some(term),
-                Err(VarError::NotPresent) => None,
-                Err(error @ VarError::NotUnicode(_)) => return Err(error.into()),
-            },
-        })
+    let terminal_fd = if !command.tty {
+        None
+    } else if io::stdin().is_terminal() {
+        Some(libc::STDIN_FILENO)
+    } else if io::stdout().is_terminal() {
+        Some(libc::STDOUT_FILENO)
+    } else if io::stderr().is_terminal() {
+        Some(libc::STDERR_FILENO)
     } else {
         None
     };
@@ -62,37 +57,54 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
         .strip_prefix(&repo_path)
         .context("current directory is outside the repository")?
         .to_path_buf();
-    let request = ExecRequest {
-        connection: ConnectPodRequest {
-            pod_name: command.name.clone(),
-            repo_path,
-            client_context: ClientContext::current(),
-        },
-        spec: ExecSpec {
-            id: ExecutionId(rand::random()),
-            command: command.command.clone(),
-            relative_workdir,
-            terminal,
-        },
-    };
-    let initial = exec_stream::encode_request(&request)?;
     let socket = daemon::socket_path()?;
     block_on(async {
         let mut interrupt = signal(SignalKind::interrupt())?;
         let mut terminate = signal(SignalKind::terminate())?;
         let mut hangup = signal(SignalKind::hangup())?;
-        let window_change = if interactive {
+        let window_change = if terminal_fd.is_some() {
             Some(signal(SignalKind::window_change())?)
         } else {
             None
         };
+        // Subscribe before sampling the size so a startup resize cannot be
+        // missed. Output terminals still supply dimensions with piped stdin.
+        let terminal = if command.tty {
+            Some(TerminalSpec {
+                size: match terminal_fd {
+                    Some(fd) => TerminalSize::from_fd(fd)?,
+                    None => TerminalSize { rows: 24, cols: 80 },
+                },
+                term: match std::env::var("TERM") {
+                    Ok(term) => Some(term),
+                    Err(VarError::NotPresent) => None,
+                    Err(error @ VarError::NotUnicode(_)) => return Err(error.into()),
+                },
+            })
+        } else {
+            None
+        };
+        let request = ExecRequest {
+            connection: ConnectPodRequest {
+                pod_name: command.name.clone(),
+                repo_path,
+                client_context: ClientContext::current(),
+            },
+            spec: ExecSpec {
+                id: ExecutionId(rand::random()),
+                command: command.command.clone(),
+                relative_workdir,
+                terminal,
+            },
+        };
+        let initial = exec_stream::encode_request(&request)?;
         let client = exec_stream::client_builder().unix_socket(socket).build()?;
         let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
         tx.send(Ok(initial)).await.context("sending exec request")?;
 
         let stdin_tx = tx;
         let _stdin = AbortOnDropHandle::new(tokio::spawn(async move {
-            if let Err(error) = forward_stdin(&stdin_tx, window_change).await {
+            if let Err(error) = forward_stdin(&stdin_tx).await {
                 if let Err(send_error) = stdin_tx.send(Err(error)).await {
                     log::debug!("exec input closed after stdin error: {send_error}");
                 }
@@ -148,9 +160,40 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
                 }
             }
         };
+        let resizes = async {
+            let (Some(fd), Some(mut changes)) = (terminal_fd, window_change) else {
+                return std::future::pending().await;
+            };
+            loop {
+                changes
+                    .recv()
+                    .await
+                    .context("exec resize signal stream closed")?;
+                let size = TerminalSize::from_fd(fd)?;
+                // Resizes must bypass a full input stream, including after
+                // stdin EOF, so a paused TUI can still redraw at the new size.
+                let response = client
+                    .post("http://localhost/pod/exec/resize")
+                    .query(&ExecResizeRequest {
+                        repo_path: request.connection.repo_path.clone(),
+                        pod_name: request.connection.pod_name.clone(),
+                        id: request.spec.id,
+                        rows: size.rows,
+                        cols: size.cols,
+                    })
+                    .send()
+                    .await
+                    .context("sending exec resize")?;
+                if !response.status().is_success() {
+                    let error = response.text().await?;
+                    return Err(anyhow::anyhow!("resizing exec terminal: {error}"));
+                }
+            }
+        };
         tokio::select! {
             result = read_output(response) => result,
             result = signals => result,
+            result = resizes => result,
         }
     })
 }
@@ -174,7 +217,7 @@ async fn read_output(response: reqwest::Response) -> Result<u8> {
             }
             Some(Frame::Exit(code)) => return Ok(code),
             Some(Frame::Error(error)) => return Err(anyhow::anyhow!("{error}")),
-            Some(Frame::Stdin(_) | Frame::StdinEof | Frame::Resize(_)) => {
+            Some(Frame::Stdin(_) | Frame::StdinEof) => {
                 return Err(anyhow::anyhow!("invalid exec response; {UNKNOWN_OUTCOME}"));
             }
             None => return Err(anyhow::anyhow!("{UNKNOWN_OUTCOME}")),
@@ -182,31 +225,17 @@ async fn read_output(response: reqwest::Response) -> Result<u8> {
     }
 }
 
-async fn forward_stdin(
-    tx: &mpsc::Sender<io::Result<Vec<u8>>>,
-    mut window_change: Option<Signal>,
-) -> io::Result<()> {
+async fn forward_stdin(tx: &mpsc::Sender<io::Result<Vec<u8>>>) -> io::Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut buffer = vec![0; CHUNK_SIZE];
     loop {
-        let frame = tokio::select! {
-            count = stdin.read(&mut buffer) => {
-                let count = count?;
-                if count == 0 {
-                    Frame::StdinEof
-                } else {
-                    Frame::Stdin(buffer[..count].to_vec())
-                }
-            }
-            _ = async {
-                match &mut window_change {
-                    Some(signal) => signal.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => Frame::Resize(TerminalSize::from_stdin().map_err(exec_stream::io_error)?),
+        let count = stdin.read(&mut buffer).await?;
+        let frame = if count == 0 {
+            Frame::StdinEof
+        } else {
+            Frame::Stdin(buffer[..count].to_vec())
         };
-        let eof = matches!(frame, Frame::StdinEof);
-        if tx.send(Ok(frame.encode())).await.is_err() || eof {
+        if tx.send(Ok(frame.encode())).await.is_err() || count == 0 {
             return Ok(());
         }
     }
@@ -216,6 +245,7 @@ pub(crate) fn daemon_routes(daemon: Arc<DaemonServer>) -> Router {
     Router::new()
         .route("/pod/exec", post(daemon_exec))
         .route("/pod/exec/signal", post(daemon_signal))
+        .route("/pod/exec/resize", post(daemon_resize))
         .with_state(daemon)
 }
 
@@ -260,6 +290,48 @@ struct ExecSignalRequest {
     pod_name: String,
     id: ExecutionId,
     signal: ExecSignal,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExecResizeRequest {
+    repo_path: PathBuf,
+    pod_name: String,
+    id: ExecutionId,
+    rows: u16,
+    cols: u16,
+}
+
+async fn daemon_resize(
+    State(daemon): State<Arc<DaemonServer>>,
+    Query(request): Query<ExecResizeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let (client, endpoint) = daemon
+        .exec_connection(&ConnectPodRequest {
+            repo_path: request.repo_path,
+            pod_name: request.pod_name,
+            client_context: ClientContext::default(),
+        })
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+    let response = client
+        .post(format!("{}/exec/resize", endpoint.url))
+        .bearer_auth(&endpoint.token)
+        .query(&ResizeRequest {
+            id: request.id,
+            rows: request.rows,
+            cols: request.cols,
+        })
+        .send()
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))?;
+        return Err((status, message));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn daemon_signal(
