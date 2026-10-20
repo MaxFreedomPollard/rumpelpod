@@ -18,9 +18,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::TryStreamExt;
 use log::info;
 use tokio::sync::broadcast;
+use tokio_util::io::{StreamReader, SyncIoBridge};
 
+use crate::async_runtime::{block_on, RUNTIME};
 use crate::config::Host;
 use crate::daemon::host_connection::HostKey;
 use crate::daemon::protocol::{DaemonEvent, PodName};
@@ -214,6 +217,9 @@ pub struct PodConnection {
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
     events_tx: broadcast::Sender<DaemonEvent>,
+    /// Shares the event stream's transport with executions, including when
+    /// several CLI processes execute commands concurrently.
+    pub(crate) http_client: reqwest::Client,
 }
 
 impl PodConnection {
@@ -244,6 +250,9 @@ impl PodConnection {
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
             events_tx,
+            http_client: crate::exec_stream::client_builder()
+                .build()
+                .expect("building pod HTTP/2 client"),
         }
     }
 
@@ -898,27 +907,32 @@ pub(super) struct GreetingState {
 }
 
 pub(super) fn connect_pod_events(
+    client: &reqwest::Client,
     url: &str,
     token: &str,
-) -> Result<(BufReader<reqwest::blocking::Response>, GreetingState), anyhow::Error> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(None)
-        .build()
-        .expect("failed to build reqwest client");
-
-    let response = client
-        .get(format!("{url}/events"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .map_err(|e| anyhow::anyhow!("connecting to pod events: {e}"))?;
+) -> Result<(impl BufRead, GreetingState), anyhow::Error> {
+    let response = block_on(
+        client
+            .get(format!("{url}/events"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send(),
+    )
+    .map_err(|e| anyhow::anyhow!("connecting to pod events: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
 
-    let mut reader = BufReader::new(response);
+    let stream = StreamReader::new(
+        response
+            .bytes_stream()
+            .map_err(crate::exec_stream::io_error),
+    );
+    let mut reader = BufReader::new(SyncIoBridge::new_with_handle(
+        stream,
+        RUNTIME.handle().clone(),
+    ));
     loop {
         let mut line = String::new();
         let n = reader

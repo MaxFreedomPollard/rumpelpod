@@ -62,6 +62,27 @@ For cases where you need a shell inside the container, use `rumpel enter`:
 rumpel enter my-pod
 ```
 
+To run a program in an already connected pod:
+
+```sh
+rumpel exec my-pod -- cargo test
+printf 'hello\n' | rumpel exec my-pod -- cat
+rumpel exec my-pod -- sh -c 'echo hello && pwd'
+```
+
+`exec` uses the pod user and its resolved environment, including `remoteEnv`
+and the shell environment probe. It maps your current directory relative to
+the local repository into the pod's repository. It runs the executable
+directly; request a shell explicitly when you need shell syntax.
+
+Input and output stream without a terminal, stdout and stderr stay separate,
+and the command's exit status becomes `rumpel`'s exit status. Connected execs
+share the daemon's existing pod connection, without a readiness probe or
+another remote handshake. Commands are never retried: if the connection
+fails before the exit status arrives, the outcome is unknown. Disconnection
+triggers best-effort termination on the pod, but cannot undo side effects.
+Use `enter` to create, start, or reconnect a pod before using `exec`.
+
 Other useful commands: `rumpel list` shows all pods for the current repository, `rumpel delete` removes a pod and its container, and `rumpel prune` deletes all stopped pods for the current repository.
 
 If a pod's host or Kubernetes cluster is permanently gone, use

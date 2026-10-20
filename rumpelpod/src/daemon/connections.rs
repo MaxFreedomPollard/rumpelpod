@@ -291,7 +291,8 @@ fn run_pod_event_loop(
         pod.set_status(PodConnectionStatus::Connecting);
         pod.emit_reconnect(ReconnectEvent::HostConnected);
 
-        let mut reader = match connect_pod_events(&endpoint.url, &endpoint.token) {
+        let mut reader = match connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token)
+        {
             Ok((reader, greeting)) => {
                 pod.apply_greeting(greeting);
                 pod.set_status(PodConnectionStatus::Connected);

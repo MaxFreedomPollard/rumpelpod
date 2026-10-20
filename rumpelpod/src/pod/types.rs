@@ -84,30 +84,6 @@ pub struct UserInfoResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Command execution
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RunRequest {
-    pub cmd: Vec<String>,
-    pub workdir: Option<PathBuf>,
-    pub env: Vec<String>,
-    /// Base64-encoded stdin data.
-    pub stdin: Option<String>,
-    pub timeout_secs: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RunResponse {
-    pub exit_code: i32,
-    /// Base64-encoded stdout.
-    pub stdout: String,
-    /// Base64-encoded stderr.
-    pub stderr: String,
-    pub timed_out: bool,
-}
-
-// ---------------------------------------------------------------------------
 // Copy (tar-based file transfer)
 // ---------------------------------------------------------------------------
 

@@ -401,6 +401,46 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    pub(crate) fn exec_connection(
+        &self,
+        request: &ConnectPodRequest,
+    ) -> Result<(reqwest::Client, crate::daemon::pod_connection::PodEndpoint)> {
+        self.remember_client_context(&request.client_context);
+        let record = {
+            let conn = self.db.lock().unwrap();
+            db::get_pod(&conn, &request.repo_path, &request.pod_name)?
+                .with_context(|| format!("pod '{}' not found", request.pod_name))?
+        };
+        let name = &request.pod_name;
+        let unavailable = || {
+            anyhow::anyhow!("pod '{name}' is not connected; use 'rumpel enter {name}' to connect")
+        };
+        match record.status {
+            db::PodStatus::Ready => {}
+            db::PodStatus::Initializing
+            | db::PodStatus::Error
+            | db::PodStatus::Stopping
+            | db::PodStatus::Deleting
+            | db::PodStatus::DeleteFailed => return Err(unavailable()),
+        }
+        let connection = self
+            .connections
+            .pod(&request.repo_path, name)
+            .ok_or_else(unavailable)?;
+        match connection.status() {
+            PodConnectionStatus::Connected => {}
+            PodConnectionStatus::Connecting
+            | PodConnectionStatus::HostDisconnected
+            | PodConnectionStatus::PodDisconnected
+            | PodConnectionStatus::Stopped => return Err(unavailable()),
+        }
+        let endpoint = connection.endpoint().ok_or_else(unavailable)?;
+        if endpoint.token != record.token {
+            return Err(unavailable());
+        }
+        Ok((connection.http_client.clone(), endpoint))
+    }
+
     fn prepared_connection(
         &self,
         request: ConnectPodRequest,
@@ -6736,7 +6776,8 @@ pub fn run_daemon() -> Result<()> {
     // Keep the server alive for the lifetime of the daemon.
     let _localhost_server = localhost_server;
 
-    let extra_routes = crate::codex::daemon_routes(daemon.clone());
+    let extra_routes = crate::codex::daemon_routes(daemon.clone())
+        .merge(crate::exec::daemon_routes(daemon.clone()));
     protocol::serve_daemon(daemon, listener, extra_routes);
 }
 

@@ -344,7 +344,7 @@ impl PodClient {
             .context("parsing /container-env response")
     }
 
-    /// GET /state -- pod metadata used by `rumpel fork`.
+    /// GET /state -- pod metadata used by fork and merge.
     pub fn get_state(&self) -> Result<StateResponse> {
         crate::async_runtime::block_on(self.get_state_async())
     }
@@ -571,42 +571,6 @@ impl PodClient {
                 Err(error.context(format!("producing mount archive: {producer_error:#}")))
             }
         }
-    }
-
-    // -------------------------------------------------------------------
-    // Command execution
-    // -------------------------------------------------------------------
-
-    pub fn run(
-        &self,
-        cmd: &[&str],
-        workdir: Option<&Path>,
-        env: &[String],
-        stdin: Option<&[u8]>,
-        timeout_secs: Option<u64>,
-    ) -> Result<RunResponse> {
-        crate::async_runtime::block_on(self.run_async(cmd, workdir, env, stdin, timeout_secs))
-    }
-
-    pub async fn run_async(
-        &self,
-        cmd: &[&str],
-        workdir: Option<&Path>,
-        env: &[String],
-        stdin: Option<&[u8]>,
-        timeout_secs: Option<u64>,
-    ) -> Result<RunResponse> {
-        self.post(
-            "/run",
-            &RunRequest {
-                cmd: cmd.iter().map(|s| s.to_string()).collect(),
-                workdir: workdir.map(|p| p.to_path_buf()),
-                env: env.to_vec(),
-                stdin: stdin.map(base64_encode),
-                timeout_secs,
-            },
-        )
-        .await
     }
 
     // -------------------------------------------------------------------

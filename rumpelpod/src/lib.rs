@@ -14,7 +14,9 @@ mod connect_cmd;
 mod container_exec;
 mod cp;
 mod devcontainer;
+mod exec;
 mod exec_proxy;
+mod exec_stream;
 mod executor;
 mod streaming_upload;
 
@@ -110,7 +112,7 @@ use cli::{
     ClaudeHookSubcommand, Cli, Command, GitHookSubcommand, HubSubcommand, ImageSubcommand, ShellArg,
 };
 
-pub fn run() -> Result<()> {
+pub fn run() -> Result<u8> {
     env_logger::init();
     completions::complete();
     let cli = Cli::parse();
@@ -161,6 +163,7 @@ pub fn run() -> Result<()> {
         Command::Enter(ref cmd) => {
             enter::enter(cmd)?;
         }
+        Command::Exec(ref cmd) => return exec::exec(cmd),
         Command::List(ref cmd) => {
             list::list(cmd)?;
         }
@@ -270,5 +273,5 @@ pub fn run() -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(0)
 }

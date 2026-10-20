@@ -80,6 +80,7 @@ type SetupDone = bool;
 /// Shared state for the in-container HTTP server.
 #[derive(Clone)]
 pub struct PodServerState {
+    pub(crate) executions: super::exec::Executions,
     pub pty_sessions: super::pty::PtySessions,
     pub ssh_relay: std::sync::Arc<tokio::sync::Mutex<Option<SshRelayConfig>>>,
     /// Repository path inside the container, set after the first /enter call.
@@ -176,6 +177,7 @@ pub fn run_container_server(
     let (claude_state_tx, _) = tokio::sync::watch::channel(None);
     let (codex_state_tx, _) = tokio::sync::watch::channel(None);
     let state = PodServerState {
+        executions: Default::default(),
         pty_sessions: super::pty::PtySessions::new(),
         ssh_relay: std::sync::Arc::new(tokio::sync::Mutex::new(Some(ssh_relay_config))),
         repo_path: std::sync::Arc::new(tokio::sync::Mutex::new(Some(repo_path.clone()))),
@@ -222,7 +224,8 @@ pub fn run_container_server(
         )
         .route("/cp", get(cp_download_handler).post(cp_upload_handler))
         .route("/init-mounts", post(init_mounts_handler))
-        .route("/run", post(run_handler))
+        .route("/exec", post(super::exec::exec_handler))
+        .route("/exec/signal", post(super::exec::signal_handler))
         .route("/events", get(events_handler))
         .route("/env", get(env_handler))
         .route("/container-env", get(container_env_handler))
@@ -2278,112 +2281,6 @@ fn rewrite_claude_settings(
     let display = settings_path.display();
     std::fs::write(&settings_path, &pretty).with_context(|| format!("writing {display}"))?;
     Ok(())
-}
-
-async fn run_handler(
-    Json(req): Json<RunRequest>,
-) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let result = tokio::task::spawn_blocking(|| run_impl(req))
-        .await
-        .expect("run_impl panicked");
-    match result {
-        Ok(resp) => ok_json(resp),
-        Err(e) => Err(err_json(e)),
-    }
-}
-
-fn run_impl(req: RunRequest) -> Result<RunResponse> {
-    use std::io::Read;
-
-    if req.cmd.is_empty() {
-        return Err(anyhow::anyhow!("empty command"));
-    }
-
-    let mut cmd = Command::new(&req.cmd[0]);
-    cmd.args(&req.cmd[1..]);
-
-    if let Some(ref workdir) = req.workdir {
-        cmd.current_dir(workdir);
-    }
-
-    for env_str in &req.env {
-        if let Some((key, value)) = env_str.split_once('=') {
-            cmd.env(key, value);
-        }
-    }
-
-    let has_stdin = req.stdin.is_some();
-    if has_stdin {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().context("spawning command")?;
-
-    if let Some(ref stdin_b64) = req.stdin {
-        let data = base64_decode(stdin_b64)?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(&data).context("writing stdin")?;
-        }
-    }
-
-    // Drain stdout and stderr in background threads to prevent deadlock
-    // when the child produces more output than the OS pipe buffer (~64KB).
-    let child_stdout = child.stdout.take().expect("stdout was piped");
-    let child_stderr = child.stderr.take().expect("stderr was piped");
-
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = child_stdout;
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut reader = child_stderr;
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
-
-    let timeout = req.timeout_secs.map(std::time::Duration::from_secs);
-
-    let (status, timed_out) = if let Some(dur) = timeout {
-        let start = std::time::Instant::now();
-        loop {
-            match child.try_wait()? {
-                Some(status) => break (status, false),
-                None => {
-                    if start.elapsed() >= dur {
-                        let _ = child.kill();
-                        let status = child.wait().context("waiting after kill")?;
-                        break (status, true);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-        }
-    } else {
-        let status = child.wait().context("waiting for command")?;
-        (status, false)
-    };
-
-    let stdout = stdout_thread.join().expect("stdout reader panicked");
-    let stderr = stderr_thread.join().expect("stderr reader panicked");
-
-    Ok(RunResponse {
-        exit_code: if timed_out {
-            -1
-        } else {
-            status.code().unwrap_or(-1)
-        },
-        stdout: base64_encode(&stdout),
-        stderr: base64_encode(&stderr),
-        timed_out,
-    })
 }
 
 // ---------------------------------------------------------------------------

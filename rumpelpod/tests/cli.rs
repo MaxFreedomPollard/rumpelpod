@@ -29,6 +29,8 @@ mod enter;
 mod env_probe_hang;
 #[path = "cli/events.rs"]
 mod events;
+#[path = "cli/exec.rs"]
+mod exec;
 #[path = "cli/executor.rs"]
 mod executor;
 #[path = "cli/fork.rs"]

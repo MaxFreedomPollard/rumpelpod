@@ -151,6 +151,19 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Enter(EnterCommand),
 
+    /// Execute a program in a connected pod without starting a shell.
+    ///
+    /// Uses the pod user and resolved environment. The working directory
+    /// corresponds to your current directory relative to the repository root.
+    /// Streams stdin, stdout, and stderr without allocating a terminal.
+    /// Commands are never retried after a connection failure.
+    ///
+    /// Examples:
+    ///   rumpel exec dev -- cargo test
+    ///   rumpel exec dev -- sh -c 'echo hello && pwd'
+    #[command(verbatim_doc_comment)]
+    Exec(ExecCommand),
+
     /// List all pods for the current repository.
     ///
     /// Shows pod name, status (running/stopped), and creation time.
@@ -464,6 +477,17 @@ pub struct EnterCommand {
 
     /// Command to run inside the pod (default: interactive shell)
     #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct ExecCommand {
+    /// Name of an existing connected pod
+    #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
+    pub name: String,
+
+    /// Executable and arguments (use sh -c explicitly for shell syntax)
+    #[arg(last = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 

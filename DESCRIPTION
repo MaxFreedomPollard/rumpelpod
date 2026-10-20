@@ -1,0 +1,16 @@
+Reuse connected transport for pod commands
+
+Add rumpel exec with direct argv execution, the pod's resolved
+environment and user, and a working directory relative to the
+repository. Keep enter's behavior intact.
+
+Share the daemon's existing HTTP/2 pod event connection so connected
+execs send one remote request without a readiness probe or another
+handshake. Stream binary stdin, stdout, stderr, and exit status with
+bounded buffers. Forward signals without DATA bodies so blocked input
+cannot prevent interruption. Disable request retries and redirects
+because losing a response cannot establish whether a command executed.
+
+Use the existing pod state snapshot for merge's dirty-checkout warning,
+removing the only caller of the buffered /run endpoint and eliminating
+that second command execution implementation.
