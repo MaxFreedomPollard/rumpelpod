@@ -10,8 +10,9 @@
 //! both live on `Connections`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -19,7 +20,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::info;
-use tokio::sync::broadcast;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use tokio::sync::{broadcast, Notify};
+use tokio_util::io::StreamReader;
 
 use crate::config::Host;
 use crate::daemon::host_connection::HostKey;
@@ -68,6 +71,7 @@ struct PodRepairState {
     paused: AtomicBool,
     epoch: Mutex<u64>,
     wake: Condvar,
+    async_wake: Notify,
 }
 
 impl PodRepairState {
@@ -90,6 +94,7 @@ impl PodRepairState {
         *epoch = epoch.wrapping_add(1);
         drop(epoch);
         self.wake.notify_all();
+        self.async_wake.notify_waiters();
     }
 
     fn epoch(&self) -> u64 {
@@ -536,6 +541,33 @@ impl PodConnection {
         self.repair_state.pause();
     }
 
+    // Host transitions invalidate both greeting requests and established
+    // reads. Epochs catch loss followed by recovery between consecutive reads.
+    pub(super) async fn event_request<F: Future>(
+        &self,
+        stop: &AtomicBool,
+        epoch: u64,
+        future: F,
+    ) -> Option<F::Output> {
+        if stop.load(Ordering::SeqCst) || self.pod_repair_epoch() != epoch {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.pod_repair_changed(epoch) => None,
+            result = future => Some(result),
+        }
+    }
+
+    pub(super) async fn pod_repair_changed(&self, epoch: u64) {
+        let changed = self.repair_state.async_wake.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if self.pod_repair_epoch() == epoch {
+            changed.await;
+        }
+    }
+
     pub fn pod_repair_epoch(&self) -> u64 {
         self.repair_state.epoch()
     }
@@ -709,6 +741,9 @@ impl PodConnection {
         );
         self.set_status(PodConnectionStatus::HostDisconnected);
         let mut resources = self.resources.lock().unwrap();
+        if let Some(proxy) = &resources.pod_server {
+            proxy.reset_connections();
+        }
         if resources.supervise_git_tunnel {
             resources.git_tunnel = None;
             resources.validate_pod_before_git_tunnel_repair = true;
@@ -897,13 +932,25 @@ pub(super) struct GreetingState {
     pub(super) codex: Option<CodexState>,
 }
 
-pub(super) fn connect_pod_events(
+pub(super) type PodEventReader = Pin<Box<dyn AsyncBufRead + Send>>;
+
+pub(super) async fn connect_pod_events(
     url: &str,
     token: &str,
-) -> Result<(BufReader<reqwest::blocking::Response>, GreetingState), anyhow::Error> {
-    let client = reqwest::blocking::Client::builder()
+) -> Result<(PodEventReader, GreetingState)> {
+    // Established streams send a heartbeat every 30 seconds. An idle read
+    // deadline detects a blackhole even when the local proxy accepts TCP.
+    connect_pod_events_with_timeout(url, token, Duration::from_secs(45)).await
+}
+
+async fn connect_pod_events_with_timeout(
+    url: &str,
+    token: &str,
+    read_timeout: Duration,
+) -> Result<(PodEventReader, GreetingState)> {
+    let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(None)
+        .read_timeout(read_timeout)
         .build()
         .expect("failed to build reqwest client");
 
@@ -911,6 +958,7 @@ pub(super) fn connect_pod_events(
         .get(format!("{url}/events"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
+        .await
         .map_err(|e| anyhow::anyhow!("connecting to pod events: {e}"))?;
 
     if !response.status().is_success() {
@@ -918,11 +966,16 @@ pub(super) fn connect_pod_events(
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
 
-    let mut reader = BufReader::new(response);
+    let stream = futures_util::stream::try_unfold(response, |mut response| async move {
+        let chunk = response.chunk().await.map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>(chunk.map(|bytes| (bytes, response)))
+    });
+    let mut reader = BufReader::new(StreamReader::new(Box::pin(stream)));
     loop {
         let mut line = String::new();
         let n = reader
             .read_line(&mut line)
+            .await
             .map_err(|e| anyhow::anyhow!("reading pod event stream: {e}"))?;
         if n == 0 {
             return Err(anyhow::anyhow!(
@@ -931,12 +984,18 @@ pub(super) fn connect_pod_events(
         }
         if line.trim() == "event: state" {
             let mut data_line = String::new();
-            reader.read_line(&mut data_line).ok();
+            reader
+                .read_line(&mut data_line)
+                .await
+                .context("reading state data")?;
             let mut blank = String::new();
-            reader.read_line(&mut blank).ok();
+            reader
+                .read_line(&mut blank)
+                .await
+                .context("reading state separator")?;
 
             let greeting = parse_greeting_state(&data_line);
-            return Ok((reader, greeting));
+            return Ok((Box::pin(reader), greeting));
         }
     }
 }
@@ -967,10 +1026,142 @@ fn parse_greeting_state(data_line: &str) -> GreetingState {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::broadcast;
 
     use super::*;
     use crate::config::ContainerEngine;
+
+    #[tokio::test]
+    async fn pod_events_cancel_on_repeated_host_loss_and_stop() {
+        let (events, _) = broadcast::channel(16);
+        let pod = PodConnection::new(
+            events,
+            PodConnectionKey::new("/repo", "pod"),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            },
+            "test-token".into(),
+            PodConnectionStatus::Connected,
+            None,
+        );
+        let stop = pod.begin_event_loop().unwrap();
+        for _ in 0..2 {
+            let epoch = pod.pod_repair_epoch();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let request = pod.event_request(&stop, epoch, async {
+                started.send(()).unwrap();
+                std::future::pending::<()>().await
+            });
+            let outage = async {
+                ready.await.unwrap();
+                pod.notify_host_disconnected();
+                pod.notify_host_connected();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(request, outage)
+            })
+            .await
+            .expect("host transition left the event request blocked");
+            assert!(result.is_none());
+            assert!(pod.event_request(&stop, epoch, async {}).await.is_none());
+            assert_eq!(
+                pod.event_request(&stop, pod.pod_repair_epoch(), async { 42 })
+                    .await,
+                Some(42)
+            );
+        }
+        let epoch = pod.pod_repair_epoch();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let request = pod.event_request(&stop, epoch, async {
+            started.send(()).unwrap();
+            std::future::pending::<()>().await
+        });
+        let shutdown = async {
+            ready.await.unwrap();
+            pod.stop_events();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(request, shutdown)
+        })
+        .await
+        .expect("stop left the event request blocked");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn pod_events_silent_transport_has_a_read_deadline() {
+        // Cover a proxy that accepts TCP without HTTP headers, an incomplete
+        // greeting, and a blackhole after the state greeting was delivered.
+        for body in [
+            "",
+            "HTTP/1.1 200 OK\r\n\r\nevent: state\n",
+            "HTTP/1.1 200 OK\r\n\r\nevent: state\ndata: {}\n\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(body.as_bytes()).await.unwrap();
+                // Stay open until the client's deadline closes its side.
+                stream.read_to_end(&mut Vec::new()).await.unwrap();
+            });
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                match connect_pod_events_with_timeout(
+                    &url,
+                    "test-token",
+                    Duration::from_millis(200),
+                )
+                .await
+                {
+                    Ok((mut reader, _)) => reader
+                        .read_line(&mut String::new())
+                        .await
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .expect("event request never expired");
+            assert!(
+                result.is_err(),
+                "silent event stream unexpectedly completed"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pod_events_heartbeats_extend_the_read_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\nevent: state\ndata: {}\n\n")
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stream.write_all(b": heartbeat\n").await.unwrap();
+            }
+        });
+        let (mut reader, _) =
+            connect_pod_events_with_timeout(&url, "test-token", Duration::from_millis(500))
+                .await
+                .unwrap();
+        for _ in 0..10 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, ": heartbeat\n");
+        }
+        server.await.unwrap();
+    }
 
     #[test]
     fn connection_and_agent_state_changes_emit_status_invalidations() {

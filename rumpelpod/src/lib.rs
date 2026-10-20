@@ -12,6 +12,7 @@ mod compose;
 pub mod config;
 mod connect_cmd;
 mod container_exec;
+mod control;
 mod cp;
 mod devcontainer;
 mod exec_proxy;

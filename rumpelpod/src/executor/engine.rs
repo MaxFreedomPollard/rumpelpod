@@ -302,10 +302,13 @@ impl Executor {
     }
 
     pub async fn status_async<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<PodStatus> {
-        match &self.inner {
-            Inner::Docker(d) => docker_status(d, id.as_ref()).await,
-            Inner::Kubernetes(k) => k.client.get_pod_status_async(id.as_ref()).await,
-        }
+        crate::control::bounded("container inspection", async {
+            match &self.inner {
+                Inner::Docker(d) => docker_status(d, id.as_ref()).await,
+                Inner::Kubernetes(k) => k.client.get_pod_status_async(id.as_ref()).await,
+            }
+        })
+        .await
     }
 
     /// Run a command inside the pod, wait for it to finish, and
@@ -387,10 +390,13 @@ impl Executor {
     /// the cluster's pull behavior and let any failure surface at
     /// pod start.
     pub async fn image_present_async(&self, image: &str) -> Result<bool> {
-        match &self.inner {
-            Inner::Docker(d) => docker_image_present(d, image).await,
-            Inner::Kubernetes(_) => Ok(true),
-        }
+        crate::control::bounded("image inspection", async {
+            match &self.inner {
+                Inner::Docker(d) => docker_image_present(d, image).await,
+                Inner::Kubernetes(_) => Ok(true),
+            }
+        })
+        .await
     }
 
     /// Interactive exec that inherits the caller's stdio.

@@ -839,13 +839,15 @@ impl Project {
 
     pub async fn service_containers_async(&self, service: &str) -> Result<Vec<String>> {
         self.model.validate_service(service)?;
-        let stdout = self
-            .run(
+        let stdout = crate::control::bounded(
+            "compose service query",
+            self.run(
                 "docker compose ps",
                 &["ps", "--all", "--quiet"],
                 &[service.to_string()],
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(String::from_utf8_lossy(&stdout)
             .lines()
             .map(str::trim)
@@ -936,11 +938,12 @@ impl Project {
     async fn container_service(&self, container: &str) -> Result<String> {
         let mut command = docker_command(&self.host, self.docker_socket.as_deref())?;
         let format_arg = format!("{{{{ index .Config.Labels {COMPOSE_SERVICE_LABEL:?} }}}}");
-        let output = command
-            .args(["container", "inspect", "--format", &format_arg, container])
-            .output_async()
-            .await
-            .context("inspecting compose service label")?;
+        command.args(["container", "inspect", "--format", &format_arg, container]);
+        let output = crate::control::bounded("compose service inspection", async {
+            Ok(command.output_async().await?)
+        })
+        .await
+        .context("inspecting compose service label")?;
         let stdout = checked_output(output, "docker container inspect")?;
         let service = String::from_utf8_lossy(&stdout).trim().to_string();
         if service.is_empty() {
@@ -953,11 +956,12 @@ impl Project {
 
     async fn container_architecture(&self, container: &str) -> Result<String> {
         let mut command = docker_command(&self.host, self.docker_socket.as_deref())?;
-        let output = command
-            .args(["container", "inspect", container])
-            .output_async()
-            .await
-            .context("inspecting compose container architecture")?;
+        command.args(["container", "inspect", container]);
+        let output = crate::control::bounded("compose container inspection", async {
+            Ok(command.output_async().await?)
+        })
+        .await
+        .context("inspecting compose container architecture")?;
         let stdout = checked_output(output, "docker container inspect")?;
         let mut inspected: Vec<ContainerInspect> =
             serde_json::from_slice(&stdout).context("parsing docker container inspect")?;
@@ -976,11 +980,12 @@ impl Project {
             .image
             .context("docker container inspect response has no Image")?;
         let mut image_command = docker_command(&self.host, self.docker_socket.as_deref())?;
-        let output = image_command
-            .args(["image", "inspect", &image])
-            .output_async()
-            .await
-            .context("inspecting compose container image architecture")?;
+        image_command.args(["image", "inspect", &image]);
+        let output = crate::control::bounded("compose image inspection", async {
+            Ok(image_command.output_async().await?)
+        })
+        .await
+        .context("inspecting compose container image architecture")?;
         let stdout = checked_output(output, "docker image inspect")?;
         let mut images: Vec<ImageInspect> =
             serde_json::from_slice(&stdout).context("parsing docker image inspect")?;
