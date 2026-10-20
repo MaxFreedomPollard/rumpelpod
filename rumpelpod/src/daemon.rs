@@ -2419,6 +2419,8 @@ struct CodexProxyHandle {
     port: u16,
     token: String,
     bypass: Arc<AtomicBool>,
+    container_url: String,
+    container_token: String,
     _cancel_tx: tokio::sync::watch::Sender<bool>,
 }
 

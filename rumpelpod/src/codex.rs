@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -28,8 +28,9 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use log::trace;
+use log::{info, trace};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite;
 use url::Url;
 
@@ -40,7 +41,7 @@ use crate::daemon::{self, DaemonServer};
 use crate::enter::{confirm_pod_creation, find_local_codex_cli, launch_pod};
 use crate::git::get_repo_root;
 use crate::pty_attach;
-use crate::pty_session::{serve_ws_session_with_params, SessionSpec};
+use crate::pty_session::{serve_ws_session_with_params, SessionSpec, SessionWatch};
 
 const CODEX_PROXY_TOKEN_ENV: &str = "RUMPELPOD_CODEX_PROXY_TOKEN";
 pub(crate) const CODEX_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
@@ -247,19 +248,189 @@ fn build_codex_spec(
         "--remote-auth-token-env".to_string(),
         CODEX_PROXY_TOKEN_ENV.to_string(),
     ];
-    // Codex starts a new remote thread when there is nothing to resume, so every
-    // spawned frontend can use the same command and survive incomplete state
-    // notifications or an app-server restart.
+    // Let Codex choose the latest remote thread, or start one when history is
+    // empty, without interpreting the frontend's protocol traffic.
     cmd.push("resume".to_string());
     cmd.push("--last".to_string());
     cmd.extend(extra_args);
 
+    let recovery = FrontendRecovery {
+        daemon: Arc::downgrade(daemon),
+        repo_path: repo_path.to_path_buf(),
+        pod_name: pod_name.to_string(),
+        codex_bin: codex_bin.to_path_buf(),
+        no_dangerously_bypass_approvals_and_sandbox,
+    };
     Ok(Some(SessionSpec {
         name: codex_session_name(repo_path, pod_name),
         cmd,
         workdir: None,
         env: vec![format!("{CODEX_PROXY_TOKEN_ENV}={}", proxy.token)],
+        on_spawn: Some(Box::new(move |watch| {
+            tokio::spawn(async move {
+                if let Err(error) = recovery.monitor(watch).await {
+                    eprintln!("codex: recovering frontend: {error:#}");
+                }
+            });
+        })),
     }))
+}
+
+struct FrontendRecovery {
+    daemon: Weak<DaemonServer>,
+    repo_path: PathBuf,
+    pod_name: String,
+    codex_bin: PathBuf,
+    no_dangerously_bypass_approvals_and_sandbox: bool,
+}
+
+impl FrontendRecovery {
+    async fn monitor(self, mut watch: SessionWatch) -> Result<()> {
+        loop {
+            if reconnect_failed(watch.screen.lock().await.screen()) {
+                break;
+            }
+            if !watch.changed().await {
+                return Ok(());
+            }
+        }
+        info!(
+            "codex: frontend for '{}' exhausted reconnects",
+            self.pod_name
+        );
+        loop {
+            if !watch.is_current().await {
+                return Ok(());
+            }
+            let Some(daemon) = self.daemon.upgrade() else {
+                return Ok(());
+            };
+            if let Some((url, token, _)) =
+                daemon.connected_codex_pod(&self.repo_path, &self.pod_name)
+            {
+                // Pod connectivity alone does not prove that its Codex daemon
+                // can initialize a frontend. Probe without starting a thread.
+                match probe_app_server(&url, &token).await {
+                    Ok(()) => {
+                        if watch
+                            .replace(|| {
+                                tokio::task::block_in_place(|| {
+                                    // Launch arguments can contain an initial
+                                    // prompt. Resume state without replaying it.
+                                    build_codex_spec(
+                                        &daemon,
+                                        &self.repo_path,
+                                        &self.pod_name,
+                                        Some(&self.codex_bin),
+                                        self.no_dangerously_bypass_approvals_and_sandbox,
+                                        Vec::new(),
+                                    )
+                                })
+                            })
+                            .await?
+                        {
+                            info!("codex: replaced exhausted frontend for '{}'", self.pod_name);
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => trace!("codex: waiting for app-server recovery: {error:#}"),
+                }
+            }
+            drop(daemon);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Codex 0.163.0 renders this status immediately above its composer. Inspect
+/// that area after terminal parsing so ANSI updates and read boundaries cannot
+/// turn conversation text or a typed draft into a restart request.
+fn reconnect_failed(screen: &vt100::Screen) -> bool {
+    let (_, cols) = screen.size();
+    let rows: Vec<String> = screen.rows(0, cols).collect();
+    let cursor_row = usize::from(screen.cursor_position().0);
+    if rows
+        .iter()
+        .any(|row| row.trim_start().starts_with("Agent command center"))
+        && rows
+            .iter()
+            .rev()
+            .find(|row| !row.trim().is_empty())
+            .is_some_and(|row| {
+                row.trim_start()
+                    .starts_with("Reconnect failed \u{2014} agent list")
+            })
+    {
+        return true;
+    }
+    let Some(composer) = rows[..=cursor_row]
+        .iter()
+        .rposition(|row| row.trim_start().starts_with('\u{203a}'))
+    else {
+        return false;
+    };
+    let Some(status) = rows[..composer].iter().rposition(|row| {
+        row.trim_start()
+            .trim_start_matches('\u{2022}')
+            .trim_start()
+            .starts_with("Reconnect failed")
+    }) else {
+        return false;
+    };
+    // Only Codex's queued-input preview may sit between the status and the
+    // composer. The quit footer distinguishes offline UI from normal history.
+    let between = &rows[status + 1..composer];
+    (between.iter().all(|row| row.trim().is_empty())
+        || between
+            .iter()
+            .find(|row| !row.trim().is_empty())
+            .is_some_and(|row| {
+                row.trim_start().trim_start_matches('\u{2022}').trim_start()
+                    == "Queued follow-up inputs"
+            }))
+        && rows[cursor_row + 1..]
+            .iter()
+            .any(|row| row.trim_end().ends_with(" quit"))
+}
+
+async fn probe_app_server(url: &str, token: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let request = build_pod_ws_request(url, token, false)?;
+        let (mut ws, _) = tokio_tungstenite::connect_async_with_config(
+            request,
+            Some(codex_websocket_config()),
+            false,
+        )
+        .await
+        .context("connecting to recovered Codex app-server")?;
+        ws.send(tungstenite::Message::Text(
+            json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "rumpelpod-recovery", "version": env!("CARGO_PKG_VERSION")},
+                },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        while let Some(message) = ws.next().await {
+            if let tungstenite::Message::Text(text) = message? {
+                let response: Value = serde_json::from_str(&text)?;
+                if response["id"] == 1 {
+                    if response.get("result").is_none() {
+                        return Err(anyhow::anyhow!("Codex initialize probe failed: {response}"));
+                    }
+                    ws.close(None).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow::anyhow!("Codex closed before answering initialize"))
+    })
+    .await
+    .context("timed out probing recovered Codex app-server")?
 }
 
 pub(crate) fn codex_session_name(repo_path: &std::path::Path, pod_name: &str) -> String {
@@ -506,4 +677,91 @@ fn build_pod_ws_request(
         )
         .body(())
         .context("building WebSocket request for pod server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_failed;
+
+    #[test]
+    fn codex_failure_banner_survives_split_terminal_updates() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let terminal = concat!(
+            "\x1b[2;1H\u{2022} \x1b[1mReconnect failed\x1b[0m",
+            " \u{2014} check the endpoint, then relaunch (2m 0s)",
+            "\x1b[4;1H\u{203a} unsent draft",
+            "\x1b[6;3H\u{2303}c quit",
+            "\x1b[4;15H",
+        );
+        for byte in terminal.as_bytes() {
+            parser.process(&[*byte]);
+        }
+        assert!(reconnect_failed(parser.screen()));
+    }
+
+    #[test]
+    fn codex_failure_text_in_draft_or_history_does_not_request_restart() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(
+            concat!(
+                "\x1b[2;1H\u{2022} Reconnect failed in quoted output",
+                "\x1b[4;1H\u{203a} Reconnect failed in a draft",
+                "\x1b[6;3H? for shortcuts",
+                "\x1b[4;20H",
+            )
+            .as_bytes(),
+        );
+        assert!(!reconnect_failed(parser.screen()));
+        parser.process(
+            concat!(
+                "\x1b[3;1H\u{2022} Reconnecting to server (1s)",
+                "\x1b[6;1H\x1b[2K  \u{2303}c quit",
+                "\x1b[4;20H",
+            )
+            .as_bytes(),
+        );
+        assert!(!reconnect_failed(parser.screen()));
+        parser.process(
+            concat!(
+                "\x1b[4;1H\x1b[2K\u{2022} Queued follow-up inputs",
+                "\x1b[5;1H  \u{21b3} queued message",
+                "\x1b[6;1H\x1b[2K\u{203a} draft",
+                "\x1b[8;3H\u{2303}c quit",
+                "\x1b[6;8H",
+            )
+            .as_bytes(),
+        );
+        assert!(!reconnect_failed(parser.screen()));
+    }
+
+    #[test]
+    fn codex_failure_banner_with_queued_input_requests_restart() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(
+            concat!(
+                "\x1b[2;1H\u{2022} Reconnect failed \u{2014} check the endpoint, then relaunch",
+                "\x1b[4;1H\u{2022} Queued follow-up inputs",
+                "\x1b[5;1H  \u{21b3} queued message",
+                "\x1b[7;1H\u{203a} draft",
+                "\x1b[9;3H\u{2303}c quit",
+                "\x1b[7;8H",
+            )
+            .as_bytes(),
+        );
+        assert!(reconnect_failed(parser.screen()));
+    }
+
+    #[test]
+    fn codex_failure_banner_in_agent_center_requests_restart() {
+        let mut parser = vt100::Parser::new(24, 100, 0);
+        parser.process(
+            concat!(
+                "\x1b[2;3HAgent command center  Group: Project  g",
+                "\x1b[5;3H\u{203a} Selected task",
+                "\x1b[24;3HReconnect failed \u{2014} agent list is stale; relaunch to retry",
+            )
+            .as_bytes(),
+        );
+        assert!(reconnect_failed(parser.screen()));
+    }
 }

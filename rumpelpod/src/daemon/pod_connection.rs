@@ -676,11 +676,15 @@ impl PodConnection {
             if let Some(handle) = resources.codex_proxy.as_ref() {
                 // A replacement frontend may choose different startup defaults.
                 // Reconnects through this cached proxy must carry that choice.
-                handle.bypass.store(bypass, Ordering::Relaxed);
-                return Ok(CodexProxyEndpoint {
-                    port: handle.port,
-                    token: handle.token.clone(),
-                });
+                if handle.container_url == container_url
+                    && handle.container_token == container_token
+                {
+                    handle.bypass.store(bypass, Ordering::Relaxed);
+                    return Ok(CodexProxyEndpoint {
+                        port: handle.port,
+                        token: handle.token.clone(),
+                    });
+                }
             }
         }
 
@@ -700,8 +704,8 @@ impl PodConnection {
         let bypass = Arc::new(AtomicBool::new(bypass));
         tokio::task::spawn(crate::codex::run_codex_proxy(
             tokio_listener,
-            container_url,
-            container_token,
+            container_url.clone(),
+            container_token.clone(),
             token.clone(),
             Arc::clone(&bypass),
             ready_tx,
@@ -715,6 +719,8 @@ impl PodConnection {
             port,
             token: token.clone(),
             bypass,
+            container_url,
+            container_token,
             _cancel_tx: cancel_tx,
         });
 
