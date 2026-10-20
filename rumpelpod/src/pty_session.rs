@@ -45,16 +45,117 @@ struct PtySession {
     /// Virtual terminal buffer tracking the screen state for replay
     /// on reattach, like screen/tmux.
     screen: Arc<Mutex<vt100::Parser>>,
-    /// Broadcast channel carrying raw PTY output bytes.  Connected
-    /// clients subscribe; the persistent reader task is the sole sender.
-    output_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    /// Attached clients follow output and child replacement on this channel.
+    output_tx: tokio::sync::broadcast::Sender<PtyOutput>,
+}
+
+#[derive(Clone)]
+enum PtyOutput {
+    Data(Vec<u8>),
+    Replaced,
 }
 
 type AttachedSession = (
-    OwnedFd,
+    u64,
     Arc<Mutex<vt100::Parser>>,
-    tokio::sync::broadcast::Receiver<Vec<u8>>,
+    tokio::sync::broadcast::Receiver<PtyOutput>,
 );
+
+/// A monitor belongs to one child, even when its name is reused by a later
+/// session. Replacement and lifecycle cleanup share the same creation lock.
+pub(crate) struct SessionWatch {
+    name: String,
+    session_id: u64,
+    sessions: PtySessions,
+    pub(crate) screen: Arc<Mutex<vt100::Parser>>,
+    output: tokio::sync::broadcast::Receiver<PtyOutput>,
+}
+
+impl SessionWatch {
+    pub(crate) async fn changed(&mut self) -> bool {
+        match self.output.recv().await {
+            Ok(PtyOutput::Data(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                true
+            }
+            Ok(PtyOutput::Replaced) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                false
+            }
+        }
+    }
+
+    pub(crate) async fn is_current(&self) -> bool {
+        self.sessions
+            .inner
+            .lock()
+            .await
+            .get(&self.name)
+            .is_some_and(|session| session.session_id == self.session_id)
+    }
+
+    pub(crate) async fn replace<F>(&self, build_spec: F) -> Result<bool>
+    where
+        F: FnOnce() -> Result<Option<SessionSpec>> + Send,
+    {
+        let creation_lock = self.sessions.creation_lock(&self.name).await;
+        let _creation_guard = creation_lock.lock().await;
+        if !self.is_current().await {
+            return Ok(false);
+        }
+        let Some(spec) = build_spec()? else {
+            return Ok(false);
+        };
+        if spec.name != self.name {
+            return Err(anyhow::anyhow!("replacement changed the PTY session name"));
+        }
+        let (rows, cols) = self.screen.lock().await.screen().size();
+        let mut sessions = self.sessions.inner.lock().await;
+        let Some(old) = sessions.get(&self.name) else {
+            return Ok(false);
+        };
+        if old.session_id != self.session_id || !child_is_alive(old.child_pid) {
+            return Ok(false);
+        }
+        // Prepare the replacement before retiring the failed frontend so a
+        // spawn error leaves an inspectable terminal instead of an empty slot.
+        let replacement = spawn_session(
+            &self.name,
+            &spec.cmd,
+            spec.workdir,
+            &spec.env,
+            cols,
+            rows,
+            &self.sessions,
+        )?;
+        let watch = replacement.watch(&self.name, &self.sessions);
+        let old = sessions
+            .insert(self.name.clone(), replacement)
+            .expect("replacement has an existing session");
+        drop(sessions);
+        // Publish the new generation before notifying attached clients so input
+        // already targets it when they switch output subscriptions.
+        let _ = old.output_tx.send(PtyOutput::Replaced);
+        match kill(old.child_pid, Signal::SIGTERM) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error).context("terminating replaced PTY child"),
+        }
+        if let Some(on_spawn) = spec.on_spawn {
+            on_spawn(watch);
+        }
+        Ok(true)
+    }
+}
+
+impl PtySession {
+    fn watch(&self, name: &str, sessions: &PtySessions) -> SessionWatch {
+        SessionWatch {
+            name: name.to_string(),
+            session_id: self.session_id,
+            sessions: sessions.clone(),
+            screen: self.screen.clone(),
+            output: self.output_tx.subscribe(),
+        }
+    }
+}
 
 type SessionCreationLocks = HashMap<String, Weak<Mutex<()>>>;
 
@@ -126,7 +227,11 @@ impl PtySessions {
         }
 
         let session = spawn_session(&name, &spec.cmd, spec.workdir, &spec.env, cols, rows, self)?;
+        let watch = session.watch(&name, self);
         self.inner.lock().await.insert(name.clone(), session);
+        if let Some(on_spawn) = spec.on_spawn {
+            on_spawn(watch);
+        }
 
         match self.attach_existing(&name, cols, rows).await? {
             Some(attached) => Ok(SessionAcquire::Attached(attached)),
@@ -157,13 +262,13 @@ impl PtySessions {
         // reattaching after a window resize (or reconnection) shows
         // the right dimensions.
         set_winsize(session.master_fd.as_raw_fd(), cols, rows)?;
-        let duped = nix::unistd::dup(&session.master_fd).context("dup master fd")?;
         let screen = Arc::clone(&session.screen);
         let rx = session.output_tx.subscribe();
+        let session_id = session.session_id;
         drop(sessions);
 
         screen.lock().await.screen_mut().set_size(rows, cols);
-        Ok(Some((duped, screen, rx)))
+        Ok(Some((session_id, screen, rx)))
     }
 
     async fn creation_lock(&self, name: &str) -> Arc<Mutex<()>> {
@@ -196,6 +301,18 @@ impl PtySessions {
             .await
             .screen_mut()
             .set_size(rows, cols);
+        Ok(())
+    }
+
+    async fn write_input(&self, name: &str, input: &[u8]) -> Result<()> {
+        let sessions = self.inner.lock().await;
+        let session = sessions
+            .get(name)
+            .with_context(|| format!("no such pty session: {name}"))?;
+        // A client may receive input before consuming its Replaced event.
+        // Resolve the current fd under the replacement lock instead of writing
+        // to an exited child and disconnecting an otherwise healthy attachment.
+        nix::unistd::write(&session.master_fd, input).context("writing to PTY child")?;
         Ok(())
     }
 
@@ -314,6 +431,7 @@ fn spawn_session(
                 sessions.clone(),
                 name.to_string(),
                 session_id,
+                child,
             );
 
             Ok(PtySession {
@@ -336,10 +454,11 @@ fn spawn_session(
 fn spawn_persistent_reader(
     fd: OwnedFd,
     screen: Arc<Mutex<vt100::Parser>>,
-    tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    tx: tokio::sync::broadcast::Sender<PtyOutput>,
     sessions: PtySessions,
     name: String,
     session_id: u64,
+    child_pid: Pid,
 ) {
     tokio::spawn(async move {
         let async_fd = match AsyncFd::new(fd) {
@@ -380,7 +499,7 @@ fn spawn_persistent_reader(
                     screen.lock().await.process(data);
                     // Send returns Err only when there are no receivers,
                     // which is normal when no client is attached.
-                    let _ = tx.send(data.to_vec());
+                    let _ = tx.send(PtyOutput::Data(data.to_vec()));
                 }
                 // EOF (read returned 0) or EIO (PTY slave closed on
                 // Linux) -- the session is over.
@@ -390,6 +509,10 @@ fn spawn_persistent_reader(
             }
         }
         sessions.remove_session(&name, session_id).await;
+        tokio::task::spawn_blocking(move || match waitpid(child_pid, None) {
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => {}
+            Err(error) => eprintln!("pty: reaping child {child_pid}: {error}"),
+        });
     });
 }
 
@@ -512,6 +635,7 @@ pub struct SessionSpec {
     pub cmd: Vec<String>,
     pub workdir: Option<PathBuf>,
     pub env: Vec<String>,
+    pub(crate) on_spawn: Option<Box<dyn FnOnce(SessionWatch) + Send>>,
 }
 
 /// Client-owned entry point: read `PtyControl::Session` from the wire,
@@ -571,6 +695,7 @@ pub async fn serve_ws_session(
             cmd,
             workdir,
             env,
+            on_spawn: None,
         }))
     })
     .await
@@ -639,14 +764,14 @@ async fn run_bridge<F>(
     mut socket: WebSocket,
     sessions: PtySessions,
     name: String,
-    cols: u16,
-    rows: u16,
+    mut cols: u16,
+    mut rows: u16,
     create: bool,
     build_spec: F,
 ) where
     F: FnOnce() -> Result<Option<SessionSpec>> + Send,
 {
-    let (write_fd, screen, mut output_rx) = match sessions
+    let (mut session_id, screen, mut output_rx) = match sessions
         .spawn_or_attach(name.clone(), cols, rows, create, build_spec)
         .await
     {
@@ -692,16 +817,34 @@ async fn run_bridge<F>(
             // Persistent reader produced output -> forward as binary
             output = output_rx.recv() => {
                 match output {
-                    Ok(data) => {
+                    Ok(PtyOutput::Data(data)) => {
                         if socket.send(Message::Binary(data.into())).await.is_err() {
                             break;
                         }
                     }
                     // Lagged: we missed some output, not fatal for a terminal
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    // Sender dropped: child exited.  Tell the client
-                    // so it can distinguish this from a network error.
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Ok(PtyOutput::Replaced)
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // A lagging client can miss Replaced, so also check for
+                        // a successor when the old output channel closes.
+                        match sessions.attach_existing(&name, cols, rows).await {
+                            Ok(Some((new_id, new_screen, new_output))) if new_id != session_id => {
+                                session_id = new_id;
+                                output_rx = new_output;
+                                let parser = new_screen.lock().await;
+                                let mut replay = b"\x1b[?1049l\x1b[0m\x1b[2J\x1b[H".to_vec();
+                                replay.extend(build_screen_replay(parser.screen()));
+                                if socket.send(Message::Binary(replay.into())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Ok(Some(_)) | Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("pty: attaching replacement for '{name}': {error:#}");
+                            }
+                        }
                         let msg = serde_json::to_string(&PtyControl::SessionEnded)
                             .expect("SessionEnded is always serializable");
                         let _ = socket.send(Message::Text(msg.into())).await;
@@ -715,16 +858,19 @@ async fn run_bridge<F>(
                 match ws_msg {
                     // Binary = raw PTY input from client
                     Some(Ok(Message::Binary(data))) => {
-                        if !data.is_empty()
-                            && nix::unistd::write(&write_fd, &data).is_err()
-                        {
-                            break;
+                        if !data.is_empty() {
+                            if let Err(error) = sessions.write_input(&name, &data).await {
+                                eprintln!("pty: input for '{name}': {error:#}");
+                                break;
+                            }
                         }
                     }
                     // Text = JSON control message
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<PtyControl>(&text) {
-                            Ok(PtyControl::Resize { cols, rows }) => {
+                            Ok(PtyControl::Resize { cols: new_cols, rows: new_rows }) => {
+                                cols = new_cols;
+                                rows = new_rows;
                                 let _ = sessions.resize(&name, cols, rows).await;
                             }
                             Ok(PtyControl::Session { .. }) | Ok(PtyControl::Attach { .. }) => {
@@ -749,8 +895,8 @@ async fn run_bridge<F>(
         }
     }
 
-    // The dup'd write_fd is dropped here; the session's master_fd and
-    // the persistent reader's fd keep the PTY alive for future reattach.
+    // The session's master and persistent reader keep the PTY alive for
+    // reattachment after this client's output subscription is dropped.
 }
 
 #[cfg(test)]

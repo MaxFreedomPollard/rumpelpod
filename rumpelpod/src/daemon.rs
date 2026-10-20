@@ -2338,12 +2338,16 @@ struct CodexProxyHandle {
     port: u16,
     token: String,
     bypass: Arc<AtomicBool>,
+    container_url: String,
+    container_token: String,
+    thread: Arc<Mutex<Option<String>>>,
     _cancel_tx: tokio::sync::watch::Sender<bool>,
 }
 
 pub(crate) struct CodexProxyEndpoint {
     pub(crate) port: u16,
     pub(crate) token: String,
+    pub(crate) thread: Arc<Mutex<Option<String>>>,
 }
 
 /// Enables test-only paths in container-serve.  Detected via the

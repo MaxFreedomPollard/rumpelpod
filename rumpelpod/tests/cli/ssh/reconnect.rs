@@ -485,14 +485,34 @@ fn mux_git_syncs_after_remote_pause() {
     wait_for_ref(harness.repo.path(), &pod_ref("alpha"), &oid);
 }
 
-/// Keep this diagnostic opt-in: it asserts the upstream failure rather than
-/// the recovery behavior rumpelpod should eventually provide.
 #[test]
-#[ignore = "reproduces Codex 0.163.0 exhausting its 120-second reconnect budget"]
-fn codex_frontend_stays_offline_after_ssh_recovers() {
+fn codex_frontend_recovers_after_ssh_retry_exhaustion() {
+    check_codex_frontend_recovery(false);
+}
+
+#[test]
+fn codex_frontend_recovers_after_ssh_retry_exhaustion_while_detached() {
+    check_codex_frontend_recovery(true);
+}
+
+fn check_codex_frontend_recovery(detach_before_recovery: bool) {
     if skip_if_unsupported() {
         return;
     }
+    // The banner is a compatibility boundary. Exercise the real version
+    // installed for tests by the devcontainer, not a stub that prints it.
+    let expected_version = include_str!("../../../../.devcontainer/Dockerfile")
+        .lines()
+        .find_map(|line| line.strip_prefix("ARG CODEX_VERSION="))
+        .expect("devcontainer pins the supported Codex version");
+    let version = Command::new("codex")
+        .arg("--version")
+        .success()
+        .expect("read test Codex version");
+    assert_eq!(
+        String::from_utf8_lossy(&version).trim(),
+        format!("codex-cli {expected_version}")
+    );
 
     let home = TestHome::new();
     setup_controlled_home(&home);
@@ -510,7 +530,10 @@ fn codex_frontend_stays_offline_after_ssh_recovers() {
     session.wait_for_ready_with_timeout(Duration::from_secs(90));
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for_with_timeout("Paris", Duration::from_secs(45));
-    let draft = "draft-kept-through-ssh-outage";
+    let original_pid = codex_frontend_pids(&daemon);
+    assert_eq!(original_pid.len(), 1);
+    // A healthy composer containing the trigger must not restart the frontend.
+    let draft = "Reconnect failed in an unsent draft";
     session.write_raw(draft.as_bytes());
     session.wait_for_with_timeout(draft, Duration::from_secs(10));
     wait_for_mux(&home, &remote, MuxState::Alive, "mux before Codex outage");
@@ -523,7 +546,7 @@ fn codex_frontend_stays_offline_after_ssh_recovers() {
     paused.resume();
     session.wait_for_absent_with_timeout("Reconnecting to server", Duration::from_secs(60));
     session.wait_for_with_timeout(draft, Duration::from_secs(15));
-    assert!(!session.screen().contents().contains("Reconnect failed"));
+    assert_eq!(codex_frontend_pids(&daemon), original_pid);
     eprintln!("The original Codex frontend recovered from the short SSH outage");
     wait_for_mux(&home, &remote, MuxState::Alive, "mux before long outage");
 
@@ -544,6 +567,11 @@ fn codex_frontend_stays_offline_after_ssh_recovers() {
         outage.elapsed()
     );
     assert!(session.screen().contents().contains(draft));
+    assert_eq!(codex_frontend_pids(&daemon), original_pid);
+    if detach_before_recovery {
+        session.write_raw(&[0x01, b'd']);
+        session.wait_for_exit();
+    }
 
     paused.resume();
     let oid = commit_in_pod(
@@ -561,27 +589,56 @@ fn codex_frontend_stays_offline_after_ssh_recovers() {
         "transport-recovered"
     );
 
-    // Fresh keystrokes force a redraw after transport recovery. Detaching and
-    // reattaching must expose the stale frontend instead of silently replacing it.
-    session.write_raw(b"-after-recovery");
-    session.wait_for_with_timeout("-after-recovery", Duration::from_secs(10));
-    assert!(session.screen().contents().contains("Reconnect failed"));
-    session.write_raw(&[0x01, b'd']);
+    // Observe replacement before attaching again: detached sessions must
+    // recover without an incoming client driving their lifecycle.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let pids = codex_frontend_pids(&daemon);
+        if pids.len() == 1 && pids != original_pid {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exhausted Codex frontend was not replaced"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if detach_before_recovery {
+        session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    }
+    session.wait_for_absent_with_timeout(draft, Duration::from_secs(30));
+    session.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    session.send_with_timeout("/status", Duration::from_secs(10));
+    session.wait_for_with_timeout("Permissions:", Duration::from_secs(15));
+    // A real new turn proves that input was moved to the replacement PTY and
+    // the frontend resumed the remote session, rather than replaying a screen.
+    session.send_with_timeout("Run `printf %x 3735928559`.", Duration::from_secs(10));
+    session.wait_for_with_timeout("deadbeef", Duration::from_secs(45));
+    session.send_with_timeout("/exit", Duration::from_secs(10));
     session.wait_for_exit();
-    let mut reattached = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    reattached.wait_for_with_timeout("Reconnect failed", Duration::from_secs(10));
-    assert!(reattached.screen().contents().contains(draft));
+    assert!(codex_frontend_pids(&daemon).is_empty());
+}
 
-    // Quitting the local frontend leaves the remote conversation available.
-    // A replacement can resume it without replaying the submitted prompt.
-    reattached.write_raw(&[0x03]);
-    reattached.write_raw(&[0x03]);
-    reattached.wait_for_exit();
-    let mut replacement = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
-    replacement.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    replacement.send_with_timeout("/status", Duration::from_secs(10));
-    replacement.wait_for_with_timeout("Permissions:", Duration::from_secs(15));
-    eprintln!("A replacement frontend resumed the conversation after SSH recovery");
+fn codex_frontend_pids(daemon: &TestDaemon) -> Vec<u32> {
+    let binary = daemon.bin_dir.join("codex");
+    let binary = binary.to_str().expect("test binary path is UTF-8");
+    let processes = Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .success()
+        .expect("list local frontend processes");
+    String::from_utf8(processes)
+        .expect("process listing is UTF-8")
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?;
+            if fields.next() == Some(binary) && fields.next() == Some("--remote") {
+                Some(pid.parse().expect("frontend PID"))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // Restore connectivity before TestDaemon's cleanup contacts the remote host,

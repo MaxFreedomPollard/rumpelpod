@@ -1,40 +1,35 @@
-Diagnose Codex failure after SSH recovery
+Recover Codex after its reconnect retries expire
 
-Codex 0.163.0 leaves its TUI alive after its reconnect budget expires,
-while rumpelpod continues reattaching to that frontend. Preserve an
-opt-in SSH outage diagnostic so recovery strategies can be evaluated
-against the real frontend, including draft retention and thread resume.
+Codex 0.163.0 leaves its frontend alive after its 120-second reconnect
+budget expires. Rumpelpod must replace that exhausted frontend after
+connectivity returns instead of reattaching users to a stranded UI.
 
-The diagnostic compares a short outage with one exceeding the retry
-budget, checks that git sync and pod entry recover independently, then
-checks stale frontend reattachment and replacement frontend recovery.
-It is ignored by default because it describes a known failure and
-deliberately waits beyond Codex's two-minute deadline.
+Watch the parsed terminal's failure status, including the agent command
+center presentation, while excluding ordinary draft and transcript text.
+Wait for the remote Codex app-server to answer initialize before
+replacing the local frontend. Short outages remain Codex's
+responsibility.
 
-Validated with Codex 0.163.0 on Linux: the diagnostic passed in 197s.
-The four required smoke tests also passed through cargo pipeline.
-This branch contains investigation coverage, not a runtime recovery fix.
+Keep attached clients connected across PTY replacement and recover
+detached sessions without a new attachment. Serialize replacement with
+lifecycle cleanup and reject monitors belonging to an obsolete session
+generation. Resume the thread observed in successful start, resume, and
+fork responses; do not replay launch arguments that can contain an
+initial prompt. Unsent drafts are intentionally discarded on
+replacement.
 
-Run it with:
-  cargo pipeline --test-threads 1 \
-    codex_frontend_stays_offline_after_ssh_recovers -- --ignored
+Integration coverage uses the real Codex version pinned by the
+devcontainer and a nested SSH host. Short outages preserve the original
+frontend and draft; long outages replace it, restore the conversation,
+and accept a new turn with clients either attached or detached. Only
+inference uses the existing LLM cache; transport, terminal rendering,
+retry timing, and process lifecycle are real.
 
-Inspected upstream Codex rust-v0.163.0 at
+Run the recovery cases with:
+  cargo pipeline codex_frontend_recovers_after_ssh_retry_exhaustion
+
+The upstream behavior was confirmed in rust-v0.163.0 at
 83086188ae0614bd882818ff1aa23f3194962012 and main at
-46d252f8bf8b09f4ef765bc72e40f02c229da3e6:
-
-- tui/src/app/reconnect.rs uses a 120-second shared deadline with
-  delays of 0, 1, 2, 4, then 8 seconds between attempts.
-- tui/src/app/startup.rs records reconnect.failed and stops scheduling
-  retries, but continues running the TUI.
-- tui/src/chatwidget/reconnect.rs preserves editable drafts and tells
-  the user to copy them before quitting and relaunching.
-- The disconnect event is internal to app-server-client; the inspected
-  CLI options and hooks expose no reconnect-exhaustion notification or
-  exit-on-disconnect policy.
-
-Prefer an upstream option to keep reconnecting, or an explicit frontend
-lifecycle event/exit policy with draft preservation. Without that,
-rumpelpod can supervise frontend replacement after its own transport
-recovers, but must account for local-only drafts, resume the correct
-thread, and avoid replaying requests whose results were lost.
+46d252f8bf8b09f4ef765bc72e40f02c229da3e6. Codex exposes no supported
+frontend retry-exhaustion notification, so the terminal banner is a
+version-sensitive compatibility boundary covered by the tests.

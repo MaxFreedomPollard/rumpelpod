@@ -633,18 +633,28 @@ impl PodConnection {
         container_token: String,
         bypass: bool,
     ) -> Result<CodexProxyEndpoint> {
-        {
+        let thread = {
             let resources = self.resources.lock().unwrap();
             if let Some(handle) = resources.codex_proxy.as_ref() {
                 // A replacement frontend may choose different startup defaults.
                 // Reconnects through this cached proxy must carry that choice.
-                handle.bypass.store(bypass, Ordering::Relaxed);
-                return Ok(CodexProxyEndpoint {
-                    port: handle.port,
-                    token: handle.token.clone(),
-                });
+                if handle.container_url == container_url
+                    && handle.container_token == container_token
+                {
+                    handle.bypass.store(bypass, Ordering::Relaxed);
+                    return Ok(CodexProxyEndpoint {
+                        port: handle.port,
+                        token: handle.token.clone(),
+                        thread: handle.thread.clone(),
+                    });
+                }
             }
-        }
+            resources
+                .codex_proxy
+                .as_ref()
+                .map(|handle| handle.thread.clone())
+                .unwrap_or_default()
+        };
 
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").context("binding codex proxy listener")?;
@@ -662,10 +672,11 @@ impl PodConnection {
         let bypass = Arc::new(AtomicBool::new(bypass));
         tokio::task::spawn(crate::codex::run_codex_proxy(
             tokio_listener,
-            container_url,
-            container_token,
+            container_url.clone(),
+            container_token.clone(),
             token.clone(),
             Arc::clone(&bypass),
+            Arc::clone(&thread),
             ready_tx,
             cancel_rx,
         ));
@@ -677,10 +688,17 @@ impl PodConnection {
             port,
             token: token.clone(),
             bypass,
+            container_url,
+            container_token,
+            thread: thread.clone(),
             _cancel_tx: cancel_tx,
         });
 
-        Ok(CodexProxyEndpoint { port, token })
+        Ok(CodexProxyEndpoint {
+            port,
+            token,
+            thread,
+        })
     }
 
     pub fn notify_host_connected(&self) {
