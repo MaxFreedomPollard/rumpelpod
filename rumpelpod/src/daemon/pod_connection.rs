@@ -217,8 +217,8 @@ pub struct PodConnection {
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
     events_tx: broadcast::Sender<DaemonEvent>,
-    /// Shares the event stream's transport with executions, including when
-    /// several CLI processes execute commands concurrently.
+    /// The event stream keeps a transport open so executions avoid another
+    /// remote handshake, including across concurrent CLI processes.
     pub(crate) http_client: reqwest::Client,
 }
 

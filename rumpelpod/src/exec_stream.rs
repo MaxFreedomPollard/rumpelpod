@@ -13,6 +13,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
+pub(crate) const HTTP2_MAX_STREAMS: u32 = 200;
+pub(crate) const HTTP2_SERVER_STREAM_WINDOW: u32 = 1024 * 1024;
+const HTTP2_CLIENT_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 pub(crate) const CONTENT_TYPE: &str = "application/vnd.rumpelpod.exec";
 pub(crate) const UNKNOWN_OUTCOME: &str =
@@ -141,6 +144,10 @@ pub(crate) fn io_error(error: impl Into<Box<dyn std::error::Error + Send + Sync>
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .http2_prior_knowledge()
+        // Stalled output consumers must not exhaust the connection window
+        // needed by other commands and the pod event stream.
+        .http2_initial_stream_window_size(HTTP2_CLIENT_STREAM_WINDOW)
+        .http2_initial_connection_window_size(HTTP2_MAX_STREAMS * HTTP2_CLIENT_STREAM_WINDOW)
         // Compression can delay small writes until a compressor fills its
         // buffer, which breaks programs that exchange prompts over pipes.
         .gzip(false)

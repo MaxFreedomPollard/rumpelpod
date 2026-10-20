@@ -14,3 +14,6 @@ because losing a response cannot establish whether a command executed.
 Use the existing pod state snapshot for merge's dirty-checkout warning,
 removing the only caller of the buffered /run endpoint and eliminating
 that second command execution implementation.
+
+Keep receive capacity available across concurrent HTTP/2 streams so
+stalled command input or output cannot starve unrelated executions.

@@ -21,8 +21,14 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
+use axum::serve::Listener;
 use axum::{Json, Router};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use super::git_setup::{self, GitSetupRequest, GitSetupSubmodulesRequest};
 use super::types::*;
@@ -32,6 +38,7 @@ use crate::devcontainer::{
     resolve_container_env_in_process, resolve_local_env_from_map, DevContainer,
     SubstitutionContext, UserEnvProbe,
 };
+use crate::exec_stream::{HTTP2_MAX_STREAMS, HTTP2_SERVER_STREAM_WINDOW};
 
 pub const TOKEN_FILE: &str = "/opt/rumpelpod/server-token";
 /// In-container path for the SSH agent socket served by the relay.
@@ -360,10 +367,41 @@ pub fn run_container_server(
             }
         });
 
-        axum::serve(listener, app).await.unwrap();
+        serve(listener, app).await.expect("serving pod requests");
     });
 
     unreachable!("container server exited")
+}
+
+async fn serve(mut listener: TcpListener, app: Router) -> Result<()> {
+    let mut connections = JoinSet::new();
+    loop {
+        let (stream, _) = tokio::select! {
+            accepted = Listener::accept(&mut listener) => accepted,
+            Some(result) = connections.join_next() => {
+                result.context("pod connection task panicked")?;
+                continue;
+            }
+        };
+        let service = TowerToHyperService::new(app.clone());
+        connections.spawn(async move {
+            let mut builder = Builder::new(TokioExecutor::new());
+            // Reserve connection credit for every allowed stream so stalled
+            // stdin cannot consume another command's receive window.
+            builder
+                .http2()
+                .initial_stream_window_size(HTTP2_SERVER_STREAM_WINDOW)
+                .initial_connection_window_size(HTTP2_MAX_STREAMS * HTTP2_SERVER_STREAM_WINDOW)
+                .max_concurrent_streams(HTTP2_MAX_STREAMS)
+                .enable_connect_protocol();
+            if let Err(error) = builder
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+            {
+                log::debug!("pod HTTP connection ended: {error}");
+            }
+        });
+    }
 }
 
 /// Signals setup_done on drop so /events never hangs.
@@ -1230,7 +1268,7 @@ fn apply_patch_impl(repo_path: &Path, patch: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// GET /state -- pure read of pod metadata used by `rumpel fork`.
+/// Fork and merge use this snapshot to inspect changes made inside the pod.
 ///
 /// Reports every local branch (with sha + upstream as a short string),
 /// the primary branch (`git config rumpelpod.pod-name`), per-agent

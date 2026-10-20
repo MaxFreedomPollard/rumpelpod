@@ -250,6 +250,138 @@ fn exec_reuses_connected_transport_for_first_and_concurrent_commands() {
 }
 
 #[test]
+fn exec_blocked_input_does_not_stall_another_command() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut blocked_commands = Vec::new();
+    for _ in 0..2 {
+        let mut blocked = pod_command(&repo, &daemon)
+            .args([
+                "exec",
+                "test",
+                "--",
+                "sh",
+                "-c",
+                "printf ready; exec sleep 60",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        blocked
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let mut stdin = blocked.stdin.take().unwrap();
+        let writer = thread::spawn(
+            move || match stdin.write_all(&vec![b'x'; 16 * 1024 * 1024]) {
+                Ok(()) => panic!("sleep unexpectedly consumed stdin"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe),
+            },
+        );
+        blocked_commands.push((blocked, writer));
+        thread::sleep(Duration::from_millis(200));
+    }
+    let mut probe = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "true"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = probe.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            probe.kill().unwrap();
+            probe.wait().unwrap();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    for (mut blocked, writer) in blocked_commands {
+        kill(Pid::from_raw(blocked.id() as i32), Signal::SIGINT).unwrap();
+        assert_eq!(blocked.wait().unwrap().code(), Some(130));
+        writer.join().unwrap();
+    }
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "commands that stopped consuming stdin blocked another exec"
+    );
+}
+
+#[test]
+fn exec_blocked_output_does_not_stall_another_command() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+
+    let mut blocked_commands = Vec::new();
+    for _ in 0..3 {
+        let mut child = pod_command(&repo, &daemon)
+            .args(["exec", "test", "--", "sh", "-c", "printf ready; exec yes"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        blocked_commands.push(child);
+        thread::sleep(Duration::from_millis(200));
+    }
+    let mut probe = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "true"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = probe.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            probe.kill().unwrap();
+            probe.wait().unwrap();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    for mut child in blocked_commands {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "commands with paused output consumers blocked another exec"
+    );
+}
+
+#[test]
 fn exec_forwards_signals_to_blocked_input_and_remaining_children() {
     let repo = TestRepo::new();
     let home = TestHome::new();
