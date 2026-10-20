@@ -40,6 +40,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 
+use crate::async_command::ProcessGroup;
 use crate::async_runtime::RUNTIME;
 use crate::config::{ContainerEngine, Host};
 use crate::executor::PodmanSshProxy;
@@ -381,7 +382,11 @@ impl LocalhostConnection {
     }
 
     pub async fn ensure_connected_async(&self) -> Result<()> {
-        let _guard = self.bring_up.lock().await;
+        // Queue delay is separate from the probe's own deadline. Many pods
+        // reconnecting together must not accumulate one full probe per waiter.
+        let _guard = timeout(ping_timeout(), self.bring_up.lock())
+            .await
+            .context("timed out waiting for another host probe; retry the connection")?;
         if ping_local_engine_async(self.engine).await {
             self.set_status(HostStatus::Connected);
             return Ok(());
@@ -596,7 +601,11 @@ impl SshConnection {
     }
 
     pub async fn ensure_connected_async(&self) -> Result<()> {
-        let _guard = self.bring_up.lock().await;
+        // Queue delay is separate from the probe's own deadline. Many pods
+        // reconnecting together must not accumulate one full probe per waiter.
+        let _guard = timeout(ping_timeout(), self.bring_up.lock())
+            .await
+            .context("timed out waiting for another host probe; retry the connection")?;
 
         if ping_ssh_engine_async(&self.destination, self.engine).await {
             self.set_status(HostStatus::Connected);
@@ -700,12 +709,14 @@ async fn ping_ssh_engine_async(destination: &str, engine: ContainerEngine) -> bo
 async fn ping_ssh_engine_inner(destination: String, engine: ContainerEngine) -> Result<()> {
     let mut child = TokioCommand::new("ssh")
         .args(ssh_dial_stdio_args(&destination, engine))
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .context("spawning ssh engine dial-stdio")?;
+    let mut group = ProcessGroup::new(&child);
 
     let mut stdin = child.stdin.take().context("ssh child stdin missing")?;
     let mut stdout = child.stdout.take().context("ssh child stdout missing")?;
@@ -726,6 +737,7 @@ async fn ping_ssh_engine_inner(destination: String, engine: ContainerEngine) -> 
         .await
         .context("reading engine ping response")?;
     let status = child.wait().await.context("waiting for ssh engine ping")?;
+    group.completed(status);
     if !status.success() {
         return Err(anyhow::anyhow!(
             "ssh engine dial-stdio exited with {status}"
@@ -831,7 +843,11 @@ impl K8sConnection {
     }
 
     pub async fn ensure_client_async(&self) -> Result<K8sClient> {
-        let _guard = self.bring_up.lock().await;
+        // Queue delay is separate from the probe's own deadline. Many pods
+        // reconnecting together must not accumulate one full probe per waiter.
+        let _guard = timeout(ping_timeout(), self.bring_up.lock())
+            .await
+            .context("timed out waiting for another host probe; retry the connection")?;
 
         let cached = {
             let state = self.state.lock().unwrap();

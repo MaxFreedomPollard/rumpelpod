@@ -17,6 +17,8 @@
 //! and a dead mux after the fault, so recovery cannot hide behind a
 //! ControlMaster that never went away.
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -26,9 +28,11 @@ use indoc::formatdoc;
 
 use super::{write_ssh_config, SshRemoteHost};
 use crate::common::{
-    pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH,
+    assert_process_exited, pod_command, wait_for_pid, write_test_devcontainer, TestDaemon,
+    TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
 };
 use crate::executor;
+use rumpelpod::daemon::protocol::{Daemon, DaemonClient, PodListMode, PodStatus};
 use rumpelpod::CommandExt;
 
 const FAST_PROBE_MS: &str = "3000";
@@ -94,11 +98,16 @@ fn write_mux_ssh_config(home: &TestHome, remote: &SshRemoteHost) {
 }
 
 fn start_mux_harness(pod_names: &[&str]) -> MuxHarness {
+    start_mux_harness_with_env(pod_names, &[])
+}
+
+fn start_mux_harness_with_env(pod_names: &[&str], extra_env: &[(&str, &str)]) -> MuxHarness {
     let home = TestHome::new();
     let remote = SshRemoteHost::start();
     write_mux_ssh_config(&home, &remote);
-    let daemon =
-        TestDaemon::start_with_env(&home, &[("RUMPELPOD_HOST_PROBE_TIMEOUT_MS", FAST_PROBE_MS)]);
+    let mut env = vec![("RUMPELPOD_HOST_PROBE_TIMEOUT_MS", FAST_PROBE_MS)];
+    env.extend_from_slice(extra_env);
+    let daemon = TestDaemon::start_with_env(&home, &env);
 
     let repo = TestRepo::new();
     write_test_devcontainer(&repo, "", "");
@@ -529,5 +538,343 @@ fn mux_ten_pods_reconnect_after_disconnect() {
             .success()
             .unwrap_or_else(|e| panic!("entering {name} after load reconnect failed: {e:#}"));
         assert_eq!(String::from_utf8_lossy(&stdout).trim(), "reconnected");
+    }
+}
+
+// A successful host probe cannot prove that an older Docker client has
+// finished. Delay completion of one real inspection while other SSH sessions
+// recover, including the host probe and a second pod's connection.
+#[test]
+fn mux_stalled_inspection_releases_lifecycle_lock_after_recovery() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let harness = start_mux_harness_with_env(
+        &["alpha", "beta"],
+        &[("RUMPELPOD_CONTROL_TIMEOUT_MS", "10000")],
+    );
+    let docker = harness.home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).expect("resolve docker binary");
+    let fault = harness.home.path().join("control-fault");
+    fs::create_dir(&fault).unwrap();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+            #!/bin/sh
+            set -eu
+            case " $* " in
+                *" container inspect "*)
+                    if [ -f '{fault}/armed' ] && mkdir '{fault}/claimed' 2>/dev/null; then
+                        '{real_docker}' "$@"
+                        echo $$ > '{fault}/parent'
+                        sh -c 'echo $$ > "{fault}/child"; exec sleep 90' &
+                        wait
+                        exit 0
+                    fi
+                    ;;
+            esac
+            exec '{real_docker}' "$@"
+        "#,
+            fault = fault.display(),
+            real_docker = real_docker.display(),
+        },
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for (round, name) in ["alpha", "beta", "alpha"].into_iter().enumerate() {
+        fs::write(fault.join("armed"), "").unwrap();
+        // Use the launch API directly: a healthy CLI can take the prepared
+        // connection fast path without asking the daemon to inspect anything.
+        let body = serde_json::json!({
+            "pod_name": name,
+            "repo_path": harness.repo.path(),
+            "host": rumpelpod::config::Host::parse(&harness.remote.ssh_spec()).unwrap(),
+            "devcontainer_path": null, "host_branch": null, "git_identity": null,
+            "claude_cli_path": null, "codex_cli_path": null,
+            "pi_cli_path": null, "grok_cli_path": null,
+            "inject_system_prompt": false, "description_file": null,
+            "local_env_vars": {}, "client_env": {},
+            "client_context": {"ssh_auth_sock": null},
+        })
+        .to_string();
+        let request = || {
+            let mut command = Command::new("curl");
+            command
+                .args([
+                    "--noproxy",
+                    "*",
+                    "--silent",
+                    "--show-error",
+                    "--no-buffer",
+                    "--fail",
+                ])
+                .arg("--unix-socket")
+                .arg(&harness.daemon.socket_path)
+                .args([
+                    "-X",
+                    "PUT",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--data-binary",
+                    &body,
+                    "http://localhost/pod",
+                ]);
+            command
+        };
+        let mut first = TestProcess::spawn(&mut request());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !fault.join("parent").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "inspection did not stall: {}",
+                first.output()
+            );
+            assert!(
+                !first.output().contains("event: error"),
+                "{}",
+                first.output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let parent = wait_for_pid(&fault.join("parent"));
+        let child = wait_for_pid(&fault.join("child"));
+        if round != 1 {
+            first.abandon();
+        }
+        let mut queued = TestProcess::spawn(&mut request());
+        queued.wait_for_output("waiting for another operation on this pod");
+
+        if round != 1 {
+            let hole = ClientBlackhole::install(&harness.remote)
+                .expect("regression needs packet filtering for its disposable SSH host");
+            let output = TestProcess::spawn(
+                pod_command(&harness.repo, &harness.daemon).args(["connect", "beta"]),
+            )
+            .failure(Duration::from_secs(10), "host outage must be detected");
+            assert!(
+                output.contains("SSH docker transport")
+                    || output.contains("waiting for another host probe"),
+                "{output}"
+            );
+            let client = DaemonClient::new_unix(&harness.daemon.socket_path);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let pods = client
+                    .list_pods(
+                        harness.repo.path().to_path_buf(),
+                        PodListMode::Offline,
+                        false,
+                    )
+                    .unwrap();
+                if pods.iter().all(|pod| pod.status == PodStatus::Disconnected) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "host loss did not invalidate both pods: {pods:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(hole);
+            let ssh_config = harness.home.path().join(".ssh/config");
+            harness.remote.wait_for_ssh_connectivity(&ssh_config);
+            TestProcess::spawn(
+                pod_command(&harness.repo, &harness.daemon).args(["connect", "beta"]),
+            )
+            .success(
+                Duration::from_secs(20),
+                "other pod must recover independently",
+            );
+        }
+
+        if round == 1 {
+            let output = first.success(Duration::from_secs(20), "stalled inspection must expire");
+            assert!(
+                output.contains("container inspection timed out"),
+                "{output}"
+            );
+        }
+        let output = queued.success(
+            Duration::from_secs(20),
+            "host recovery must not leave entry queued behind a stale inspection",
+        );
+        assert!(output.contains("event: result"), "{output}");
+        assert_process_exited(parent);
+        assert_process_exited(child);
+        TestProcess::spawn(
+            pod_command(&harness.repo, &harness.daemon).args(["enter", name, "--", "true"]),
+        )
+        .success(Duration::from_secs(20), "fresh entry after cancellation");
+        assert_eq!(mux_state(&harness.home, &harness.remote), MuxState::Alive);
+        fs::remove_file(fault.join("armed")).unwrap();
+        fs::remove_dir(fault.join("claimed")).unwrap();
+        fs::remove_file(fault.join("parent")).unwrap();
+        fs::remove_file(fault.join("child")).unwrap();
+    }
+}
+
+#[test]
+fn mux_stalled_tunnel_setup_allows_a_later_connection() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let harness = start_mux_harness_with_env(
+        &["tunnel-stall"],
+        &[("RUMPELPOD_CONTROL_TIMEOUT_MS", "10000")],
+    );
+    let docker = harness.home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let armed = harness.home.path().join("stall-tunnel");
+    fs::write(&armed, "").unwrap();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        set -eu
+        case " $* " in
+            *" tunnel-server "*|*" tunnel-server")
+                if [ -f '{armed}' ]; then
+                    echo $$ > '{armed}.pid'
+                    exec sleep 90
+                fi
+                ;;
+        esac
+        exec '{real_docker}' "$@"
+    "#, armed = armed.display(), real_docker = real_docker.display()},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Kill only this fixture's tunnel server. Background repair and the
+    // foreground connection can then contend on the same setup mutex.
+    let container = inner_container(&harness.remote, "tunnel-stall");
+    remote_docker(
+        &harness.remote,
+        &[
+            "exec",
+            &container,
+            "pkill",
+            "-f",
+            "^/opt/rumpelpod/bin/rumpel tunnel-server$",
+        ],
+    )
+    .expect("stop disposable tunnel server");
+    let stalled = wait_for_pid(&armed.with_extension("pid"));
+    let mut connect = TestProcess::spawn(
+        pod_command(&harness.repo, &harness.daemon).args(["connect", "tunnel-stall"]),
+    );
+    let output = connect.failure(Duration::from_secs(35), "tunnel setup must have a deadline");
+    assert!(output.contains("git tunnel setup"), "{output}");
+    fs::remove_file(armed).unwrap();
+    TestProcess::spawn(
+        pod_command(&harness.repo, &harness.daemon).args(["connect", "tunnel-stall"]),
+    )
+    .success(
+        Duration::from_secs(30),
+        "repaired transport must connect without stale setup work",
+    );
+    assert_process_exited(stalled);
+    TestProcess::spawn(pod_command(&harness.repo, &harness.daemon).args([
+        "enter",
+        "tunnel-stall",
+        "--",
+        "echo",
+        "connected",
+    ]))
+    .success(
+        Duration::from_secs(20),
+        "entry must work after tunnel repair",
+    );
+}
+
+#[test]
+fn mux_pod_proxy_reaps_stalled_sessions_and_preserves_listener() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let harness = start_mux_harness(&["proxy-stall"]);
+    let client = DaemonClient::new_unix(&harness.daemon.socket_path);
+    let endpoint = client
+        .prepared_pod_connection(rumpelpod::daemon::protocol::ConnectPodRequest {
+            pod_name: "proxy-stall".into(),
+            repo_path: harness.repo.path().to_path_buf(),
+            client_context: Default::default(),
+        })
+        .unwrap()
+        .unwrap();
+    let docker = harness.home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let fault = harness.home.path().join("proxy-fault");
+    fs::create_dir(&fault).unwrap();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        set -eu
+        case " $* " in
+            *" tcp-proxy "*)
+                if mkdir '{fault}/claimed' 2>/dev/null; then
+                    echo $$ > '{fault}/pid'
+                    exec sleep 90
+                fi
+                ;;
+        esac
+        exec '{real_docker}' "$@"
+    "#, fault = fault.display(), real_docker = real_docker.display()},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let request = || {
+        let mut command = Command::new("curl");
+        command
+            .args(["--noproxy", "*", "--silent", "--show-error", "--fail"])
+            .arg("-H")
+            .arg(format!(
+                "Authorization: Bearer {}",
+                endpoint.container_token
+            ))
+            .arg(format!("{}/state", endpoint.container_url));
+        command
+    };
+
+    for host_loss in [false, true] {
+        let mut pending = TestProcess::spawn(&mut request());
+        let stalled = wait_for_pid(&fault.join("pid"));
+        if host_loss {
+            let hole = ClientBlackhole::install(&harness.remote)
+                .expect("regression needs packet filtering for its disposable SSH host");
+            TestProcess::spawn(
+                pod_command(&harness.repo, &harness.daemon).args(["connect", "proxy-stall"]),
+            )
+            .failure(Duration::from_secs(10), "host probe must report outage");
+            assert_process_exited(stalled);
+            pending.failure(
+                Duration::from_secs(5),
+                "host reset must close the stalled HTTP session",
+            );
+            drop(hole);
+            harness
+                .remote
+                .wait_for_ssh_connectivity(&harness.home.path().join(".ssh/config"));
+        } else {
+            // No host transition: cancelling a timed-out HTTP observer alone
+            // must reap its exec instead of waiting forever on remote stdout.
+            pending.abandon();
+            assert_process_exited(stalled);
+        }
+        // Reuse the original URL; resetting a bridge must not replace its
+        // listener or interrupt an independently established SSH master.
+        TestProcess::spawn(&mut request()).success(
+            Duration::from_secs(15),
+            "original pod endpoint must still work",
+        );
+        if !host_loss {
+            fs::remove_file(fault.join("pid")).unwrap();
+            fs::remove_dir(fault.join("claimed")).unwrap();
+        }
     }
 }

@@ -7,18 +7,23 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use indoc::formatdoc;
 use indoc::indoc;
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use rumpelpod::config::{load_json_config, ContainerEngine, Host};
 use rumpelpod::daemon::protocol::{
     ContainerId, Daemon, DaemonClient, EnsurePiConfigRequest, LaunchProgress, LaunchResult,
     PodLaunchParams, PodName,
 };
 use rumpelpod::CommandExt;
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 /// Standard test user name used in test images.
 pub const TEST_USER: &str = "testuser";
@@ -701,4 +706,139 @@ pub fn write_test_devcontainer(repo: &TestRepo, extra_dockerfile: &str, extra_js
         devcontainer_json,
     )
     .expect("Failed to write devcontainer.json");
+}
+
+// A failed assertion must reap the CLI before TestDaemon removes the pods.
+// Files keep diagnostics available without a pipe reader that could itself
+// hang when an abandoned process retains stdout or stderr.
+pub(crate) struct TestProcess {
+    pub(crate) child: Child,
+    log: NamedTempFile,
+}
+
+impl TestProcess {
+    pub(crate) fn spawn(command: &mut Command) -> Self {
+        let log = NamedTempFile::new().expect("create command log");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(log.as_file().try_clone().expect("open stdout log"))
+            .stderr(log.as_file().try_clone().expect("open stderr log"))
+            .spawn()
+            .expect("spawn test command");
+        Self { child, log }
+    }
+
+    pub(crate) fn output(&self) -> String {
+        fs::read_to_string(self.log.path()).expect("read command log")
+    }
+
+    pub(crate) fn wait_for_output(&mut self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let output = self.output();
+            if output.contains(marker) {
+                return;
+            }
+            assert!(
+                self.child.try_wait().expect("poll command").is_none(),
+                "command exited before {marker:?}:\n{output}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "command never reached {marker:?}:\n{output}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn success(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(status.success(), "{reason}: {status}\n{output}");
+        output
+    }
+
+    pub(crate) fn failure(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(!status.success(), "{reason}: command succeeded\n{output}");
+        output
+    }
+
+    fn wait(&mut self, timeout: Duration, reason: &str) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll command") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{reason}: command did not finish within {timeout:?}\n{}",
+                self.output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn abandon(&mut self) {
+        assert!(
+            self.child.try_wait().expect("poll launch").is_none(),
+            "launch finished before its CLI could be abandoned:\n{}",
+            self.output()
+        );
+        self.child.kill().expect("kill launching CLI");
+        self.child.wait().expect("reap launching CLI");
+    }
+}
+
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => eprintln!("failed to poll test command during cleanup: {e}"),
+        }
+        if let Err(e) = self.child.kill() {
+            eprintln!("failed to kill test command during cleanup: {e}");
+        }
+        if let Err(e) = self.child.wait() {
+            eprintln!("failed to reap test command during cleanup: {e}");
+        }
+    }
+}
+
+pub(crate) fn wait_for_pid(path: &Path) -> Pid {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => {
+                return Pid::from_raw(text.trim().parse().expect("parse command PID"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("read PID marker: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command did not write {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn assert_process_exited(pid: Pid) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match kill(pid, None) {
+            Err(Errno::ESRCH) => return,
+            Ok(()) => {}
+            Err(e) => panic!("probe command {pid}: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled startup left process {pid} alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

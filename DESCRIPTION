@@ -1,0 +1,24 @@
+Prevent stale transport work from blocking pods
+
+A detached startup can retain a pod's lifecycle mutex indefinitely when
+a separate backend command stops responding. A successful host probe
+does not complete that command, so reconnecting clients can remain
+queued forever.
+
+Bound read-only backend queries, host probe queues, tunnel setup, and
+lifecycle waiters. Report the active operation, phase, and age without
+exposing command arguments. Cancel owned local process groups on control
+deadlines, while leaving builds, hooks, transfers, arbitrary commands,
+and uncertain lifecycle mutations under their original owner's lock.
+
+Replace remote tunnel process killing with a progress lease so a delayed
+cleanup command cannot kill a replacement tunnel. Keep heartbeats
+independent of forwarded stream handling. Interrupt pod event requests
+and owned proxy sessions on host invalidation or HTTP observer
+cancellation. Preserve TCP half-closes for forwarded services and detect
+silent event transports with a read deadline that heartbeats renew.
+
+Exercise delayed control completion over disposable OpenSSH hosts,
+repeated outages, multiple pods, successful subsequent entry, detached
+startup, and stream liveness. Reuse the existing process fixtures for
+bounded assertions and cancellation cleanup checks.
