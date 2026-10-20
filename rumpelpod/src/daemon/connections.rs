@@ -295,7 +295,7 @@ fn run_pod_event_loop(
         let Some(connected) = crate::async_runtime::block_on(pod.event_request(
             &stop,
             connection_epoch,
-            connect_pod_events(&endpoint.url, &endpoint.token),
+            connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token),
         )) else {
             continue;
         };

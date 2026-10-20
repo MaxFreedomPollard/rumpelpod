@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -22,43 +23,16 @@ fn check_dirty_checkout(cmd: &MergeCommand) -> Result<()> {
         cmd.container_config.resolve_host()?,
         cmd.container_config.devcontainer.clone(),
     )?;
-    let container_repo_path = result.container_repo_path.clone();
-
-    let pod = crate::pod::PodClient::connect(&result.container_url, &result.container_token)?;
-    let run_result = pod
-        .run(
-            &[
-                "git",
-                "-C",
-                &container_repo_path.to_string_lossy(),
-                "status",
-                "--porcelain",
-            ],
-            None,
-            &[],
-            None,
-            Some(30),
-        )
-        .context("failed to check pod working tree status")?;
-
-    if run_result.exit_code != 0 {
-        use base64::Engine;
-        let stderr = base64::engine::general_purpose::STANDARD
-            .decode(&run_result.stderr)
-            .unwrap_or_default();
-        let stderr = String::from_utf8_lossy(&stderr);
-        let stderr = stderr.trim();
-        return Err(anyhow::anyhow!(
-            "git status in pod '{pod_name}' failed: {stderr}"
-        ));
-    }
-
-    use base64::Engine;
-    let stdout = base64::engine::general_purpose::STANDARD
-        .decode(&run_result.stdout)
-        .unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout);
-    if !stdout.trim().is_empty() {
+    let pod = crate::pod::PodClient::new_with_timeout(
+        &result.container_url,
+        &result.container_token,
+        Duration::from_secs(30),
+    )?;
+    if pod
+        .get_state()
+        .context("failed to check pod working tree status")?
+        .dirty
+    {
         eprintln!("warning: pod '{pod_name}' has uncommitted changes");
     }
 

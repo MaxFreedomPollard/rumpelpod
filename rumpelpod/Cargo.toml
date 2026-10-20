@@ -39,7 +39,7 @@ chrono = { version = ">= 0", features = ["serde"] }
 libc = ">= 0"
 reflink-copy = ">= 0"
 git2 = { version = ">= 0", default-features = false }
-reqwest = { version = ">= 0", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip", "stream"] }
+reqwest = { version = ">= 0", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip", "stream", "http2"] }
 base64 = ">= 0"
 indoc = ">= 0"
 strum = { version = ">= 0", features = ["derive"] }
@@ -50,10 +50,10 @@ rand = ">= 0"
 tempfile = ">= 0"
 listenfd = ">= 0"
 url = ">= 0"
-axum = { version = ">= 0", features = ["ws"] }
+axum = { version = ">= 0", features = ["ws", "http2"] }
 tokio-tungstenite = ">= 0"
 hyper = { version = ">= 0", features = ["server", "http1"] }
-hyper-util = { version = ">= 0", features = ["tokio"] }
+hyper-util = { version = ">= 0", features = ["tokio", "server-auto", "service"] }
 tower = { version = ">= 0", features = ["util"] }
 cgi-service = ">= 0"
 rusqlite = { version = ">= 0", features = ["bundled", "chrono", "backup"] }

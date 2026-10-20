@@ -219,6 +219,9 @@ pub struct PodConnection {
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
     events_tx: broadcast::Sender<DaemonEvent>,
+    /// The event stream keeps a transport open so executions avoid another
+    /// remote handshake, including across concurrent CLI processes.
+    pub(crate) http_client: reqwest::Client,
 }
 
 impl PodConnection {
@@ -249,6 +252,9 @@ impl PodConnection {
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
             events_tx,
+            http_client: crate::exec_stream::client_builder()
+                .build()
+                .expect("building pod HTTP/2 client"),
         }
     }
 
@@ -935,39 +941,44 @@ pub(super) struct GreetingState {
 pub(super) type PodEventReader = Pin<Box<dyn AsyncBufRead + Send>>;
 
 pub(super) async fn connect_pod_events(
+    client: &reqwest::Client,
     url: &str,
     token: &str,
 ) -> Result<(PodEventReader, GreetingState)> {
     // Established streams send a heartbeat every 30 seconds. An idle read
     // deadline detects a blackhole even when the local proxy accepts TCP.
-    connect_pod_events_with_timeout(url, token, Duration::from_secs(45)).await
+    connect_pod_events_with_timeout(client, url, token, Duration::from_secs(45)).await
 }
 
 async fn connect_pod_events_with_timeout(
+    client: &reqwest::Client,
     url: &str,
     token: &str,
     read_timeout: Duration,
 ) -> Result<(PodEventReader, GreetingState)> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(read_timeout)
-        .build()
-        .expect("failed to build reqwest client");
-
-    let response = client
-        .get(format!("{url}/events"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to pod events: {e}"))?;
+    // Limit idle reads on this event stream, not on the shared client:
+    // executions can legitimately remain silent for longer than this deadline.
+    let response = tokio::time::timeout(
+        read_timeout,
+        client
+            .get(format!("{url}/events"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send(),
+    )
+    .await
+    .context("waiting for pod event headers")?
+    .context("connecting to pod events")?;
 
     if !response.status().is_success() {
         let status = response.status();
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
 
-    let stream = futures_util::stream::try_unfold(response, |mut response| async move {
-        let chunk = response.chunk().await.map_err(std::io::Error::other)?;
+    let stream = futures_util::stream::try_unfold(response, move |mut response| async move {
+        let chunk = tokio::time::timeout(read_timeout, response.chunk())
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?
+            .map_err(std::io::Error::other)?;
         Ok::<_, std::io::Error>(chunk.map(|bytes| (bytes, response)))
     });
     let mut reader = BufReader::new(StreamReader::new(Box::pin(stream)));
@@ -1026,12 +1037,69 @@ fn parse_greeting_state(data_line: &str) -> GreetingState {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::routing::get;
+    use axum::Router;
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::broadcast;
 
     use super::*;
     use crate::config::ContainerEngine;
+
+    #[tokio::test]
+    async fn pod_events_idle_timeout_does_not_limit_shared_client_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/events",
+                get(|| async {
+                    let greeting = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>("event: state\ndata: {}\n\n")
+                    });
+                    Body::from_stream(greeting.chain(futures_util::stream::pending()))
+                }),
+            )
+            .route(
+                "/quiet",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "done"
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = crate::exec_stream::client_builder().build().unwrap();
+        let (mut reader, _) = connect_pod_events_with_timeout(
+            &client,
+            &url,
+            "test-token",
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let mut event = String::new();
+        let quiet = async {
+            client
+                .get(format!("{url}/quiet"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        };
+        let (event_result, quiet_result) = tokio::join!(reader.read_line(&mut event), quiet);
+        assert_eq!(
+            event_result.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(quiet_result, "done");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn pod_events_cancel_on_repeated_host_loss_and_stop() {
@@ -1111,6 +1179,7 @@ mod tests {
             });
             let result = tokio::time::timeout(Duration::from_secs(3), async {
                 match connect_pod_events_with_timeout(
+                    &reqwest::Client::new(),
                     &url,
                     "test-token",
                     Duration::from_millis(200),
@@ -1151,10 +1220,14 @@ mod tests {
                 stream.write_all(b": heartbeat\n").await.unwrap();
             }
         });
-        let (mut reader, _) =
-            connect_pod_events_with_timeout(&url, "test-token", Duration::from_millis(500))
-                .await
-                .unwrap();
+        let (mut reader, _) = connect_pod_events_with_timeout(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
         for _ in 0..10 {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();

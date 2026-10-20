@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod codex;
+mod exec;
 pub mod git_setup;
 pub mod lifecycle;
 pub mod pty;
