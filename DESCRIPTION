@@ -6,12 +6,12 @@ an idle TUI need not produce another update. Preserve the startup loop's
 need for fresh output after submitting Enter. A regression test covers
 presence and absence waits whose conditions are already satisfied.
 
-Allow three retries per failed test in the Linux CI pipeline, while
-raising its shared retry budget to twenty. Five tracked flaky tests can
-each consume three retries and leave five for other failures. Expose the
-budget through --retry-budget and consume it atomically so concurrent
-failures cannot underflow the counter. Local defaults remain one retry
-per test and ten across the suite for faster feedback.
+Allow two retries per failed test in Linux CI, with a shared budget of
+twenty. Limit repeated work on any single failure while leaving room for
+unrelated transient failures. Expose the budget through --retry-budget
+and consume it atomically so concurrent failures cannot underflow the
+counter. Local defaults remain one retry per test and ten across the
+suite for faster feedback.
 
 Inspected CI logs show repeated Claude exit failures and recoverable
 Kubernetes and SSH flakes, without exhausting the shared retry budget.

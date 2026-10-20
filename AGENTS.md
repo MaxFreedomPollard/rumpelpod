@@ -27,7 +27,7 @@ This is a rust project implementing an isolated LLM agent runner (rumpelpod).
   and runs each test as a separate process with timeouts and retries.
   Flags: `--test-threads N`, `--timeout SECS`, `--retries N`, `--retry-budget N`.
   Every test is automatically retried once on failure (subject to a global retry budget).
-  The shared budget defaults to 10; CI uses 3 retries per test and a budget of 20.
+  The shared budget defaults to 10; CI uses 2 retries per test and a budget of 20.
   Runs all tests to completion even when some fail.
   `--timeout` / `XTEST_TIMEOUT` set the default per-test deadline (120s).
   Non-default deadlines live in `tools/xtest-timeouts.json5` as integer
