@@ -1,0 +1,8 @@
+Keep terminal exec compilable on macOS
+
+The macOS libc bindings define TIOCSCTTY as c_uint, while ioctl takes a
+c_ulong request. The terminal exec code therefore failed to compile in
+the macos-arm64 CI job.
+
+Convert the request to ioctl's inferred argument type so it also matches
+the Linux musl and glibc signatures.
