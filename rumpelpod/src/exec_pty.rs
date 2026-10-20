@@ -127,7 +127,8 @@ impl Pty {
                 setsid().map_err(io::Error::from)?;
                 // SSH opens /dev/tty for passwords; terminal stdio alone does
                 // not give the process a controlling terminal.
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+                // macOS defines TIOCSCTTY as c_uint although ioctl takes c_ulong.
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
