@@ -24,3 +24,15 @@ fn codex_smoke() {
     session.send("Run `printf %x 3735928559`.");
     session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }
+
+#[test]
+fn codex_wait_accepts_the_current_screen() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    session.wait_for_ready();
+
+    // Readiness has already consumed the status response. Matching it again
+    // must not depend on Codex emitting another terminal update.
+    session.wait_for_with_timeout("Permissions:", Duration::ZERO);
+    session.wait_for_absent_with_timeout("Waiting for startup", Duration::ZERO);
+}

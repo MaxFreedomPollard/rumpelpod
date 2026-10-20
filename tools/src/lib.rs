@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Context, Result};
 
@@ -35,6 +36,14 @@ use anyhow::{Context, Result};
 /// Explicit CLI and environment overrides are applied after this default.
 pub fn default_xtest_jobs(available: usize) -> usize {
     available.min(32)
+}
+
+/// Check and decrement together so concurrent failures cannot underflow
+/// the shared budget and admit more retries than allowed.
+pub fn take_xtest_retry(budget: &AtomicU64) -> bool {
+    budget
+        .fetch_update(Relaxed, Relaxed, |remaining| remaining.checked_sub(1))
+        .is_ok()
 }
 
 /// Build a `cargo` Command with Cargo-injected env vars stripped.

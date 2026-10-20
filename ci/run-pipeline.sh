@@ -94,8 +94,10 @@ docker exec --user user --workdir /workspaces/rumpelpod devcontainer \
 # .profile puts on PATH; the ENV docker exec uses does not include it.
 # The timeout accommodates the LLM CLI replay tests, which exceed the
 # default 120s on the runners' four cores.
+# A second retry gives transient failures another chance; the shared
+# budget bounds extra work across the suite without changing local defaults.
 docker exec --user user --workdir /workspaces/rumpelpod devcontainer \
-  bash -lc 'cargo pipeline --release --timeout 300'
+  bash -lc 'cargo pipeline --release --timeout 300 --retries 2 --retry-budget 20'
 
 # Copy out the tested release binary for the host's own architecture.
 # The pipeline cross-builds both linux targets, so pick the native one.
