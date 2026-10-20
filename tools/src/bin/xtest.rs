@@ -22,7 +22,7 @@
 //!   and the suite is started in descending timeout order.
 //!
 //! - **Retries** -- failed tests are re-run up to N times (default 1),
-//!   subject to a global retry budget (RETRY_BUDGET) that prevents
+//!   subject to a global retry budget (`--retry-budget`, default 10) that prevents
 //!   flaky-test workarounds from masking widespread breakage.
 //!
 //! - **Skip** -- tests can declare themselves not applicable for the
@@ -55,6 +55,7 @@
 //!   --test-threads N   parallel tests (env: XTEST_JOBS, default: min(ncpus, 32))
 //!   --timeout SECS     default per-test kill deadline  (env: XTEST_TIMEOUT, default: 120)
 //!   --retries N        retry count on failure  (env: XTEST_RETRIES, default: 1)
+//!   --retry-budget N   maximum retries across the suite (default: 10)
 //!   --executor NAME    run against podman or a k8s cluster (podman|eks|hetzner|k3d)
 //! ```
 
@@ -76,9 +77,9 @@ use serde::Deserialize;
 use tools::cargo_cmd;
 use tools::CommandExt;
 
-/// Maximum number of retries across all tests in a single run.
+/// Default limit on retries across all tests in a single run.
 /// Keeps flaky-test workarounds from masking systemic problems.
-const RETRY_BUDGET: usize = 10;
+const DEFAULT_RETRY_BUDGET: u64 = 10;
 
 /// (cargo target triple, binary name in flat layout)
 const LINUX_TARGETS: &[(&str, &str)] = &[
@@ -122,6 +123,10 @@ struct Cli {
     /// Number of retries for failed tests (default: 1, env: XTEST_RETRIES).
     #[arg(long)]
     retries: Option<usize>,
+
+    /// Maximum retries across the suite; zero disables retries.
+    #[arg(long, default_value_t = DEFAULT_RETRY_BUDGET)]
+    retry_budget: u64,
 
     /// File containing test names to skip (one per line).
     /// Used by `cargo pipeline --continue` to resume from a previous run.
@@ -403,6 +408,8 @@ struct RunConfig {
     timeout: Duration,
     /// Number of retries for failed tests.
     retries: usize,
+    /// Shared limit so widespread failures cannot multiply the whole suite.
+    retry_budget: u64,
     /// Number of parallel jobs.
     jobs: usize,
 }
@@ -769,8 +776,7 @@ fn run_test_with_retries(
                 retry_log,
             };
         }
-        let budget_left = retry_budget.load(Relaxed) > 0;
-        if !budget_left {
+        if !tools::take_xtest_retry(retry_budget) {
             retry_log.push(format!(
                 "attempt {attempt}: {} ({:.1}s), retry budget exhausted",
                 outcome_label(result.outcome),
@@ -785,7 +791,6 @@ fn run_test_with_retries(
                 retry_log,
             };
         }
-        retry_budget.fetch_sub(1, Relaxed);
         retry_log.push(format!(
             "attempt {attempt}: {} ({:.1}s), retrying",
             outcome_label(result.outcome),
@@ -835,7 +840,7 @@ fn run_tests(cases: Vec<TestCase>, config: &RunConfig) -> Vec<TestResult> {
     let queue = Mutex::new(cases.into_iter());
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let wall_start = Instant::now();
-    let retry_budget = AtomicU64::new(RETRY_BUDGET as u64);
+    let retry_budget = AtomicU64::new(config.retry_budget);
     let interrupted = Arc::new(AtomicBool::new(false));
 
     // On Ctrl-C, set the interrupted flag so workers stop picking up
@@ -1328,6 +1333,7 @@ fn run() -> Result<ExitCode> {
         env_vars,
         timeout: Duration::from_secs(timeout_secs),
         retries,
+        retry_budget: cli.retry_budget,
         jobs,
     };
 
@@ -1354,11 +1360,12 @@ fn run() -> Result<ExitCode> {
     }
 
     eprintln!(
-        "Running {} tests ({} jobs, {}s timeout, {} retries)",
+        "Running {} tests ({} jobs, {}s timeout, {} retries, {} total retry budget)",
         cases.len(),
         config.jobs,
         timeout_secs,
         config.retries,
+        config.retry_budget,
     );
 
     let results = run_tests(cases, &config);
