@@ -26,6 +26,19 @@ pub(crate) struct ExecSpec {
     pub id: ExecutionId,
     pub command: Vec<String>,
     pub relative_workdir: PathBuf,
+    pub terminal: Option<TerminalSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TerminalSpec {
+    pub size: TerminalSize,
+    pub term: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,6 +73,13 @@ pub(crate) enum ExecSignal {
 pub(crate) struct SignalRequest {
     pub id: ExecutionId,
     pub signal: ExecSignal,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ResizeRequest {
+    pub id: ExecutionId,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 pub(crate) enum Frame {

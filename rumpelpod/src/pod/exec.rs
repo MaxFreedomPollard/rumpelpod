@@ -25,11 +25,18 @@ use tokio_util::io::StreamReader;
 
 use super::server::PodServerState;
 use crate::async_command::ProcessGroup;
+use crate::exec_pty::{Pty, TerminalSession};
 use crate::exec_stream::{
-    self, ExecSignal, ExecSpec, ExecutionId, Frame, SignalRequest, CHUNK_SIZE, CONTENT_TYPE,
+    self, ExecSignal, ExecSpec, ExecutionId, Frame, ResizeRequest, SignalRequest, TerminalSize,
+    CHUNK_SIZE, CONTENT_TYPE,
 };
 
-pub(crate) type Executions = Arc<Mutex<HashMap<ExecutionId, mpsc::Sender<Signal>>>>;
+pub(crate) type Executions = Arc<Mutex<HashMap<ExecutionId, mpsc::Sender<Control>>>>;
+
+pub(crate) enum Control {
+    Signal(Signal),
+    Resize(TerminalSize),
+}
 
 struct RegisteredExecution {
     executions: Executions,
@@ -53,12 +60,31 @@ pub(super) async fn signal_handler(
     };
     let sender = state.executions.lock().unwrap().get(&request.id).cloned();
     if let Some(sender) = sender {
-        if let Err(error) = sender.send(signal).await {
+        if let Err(error) = sender.send(Control::Signal(signal)).await {
             log::debug!("exec finished before signal delivery: {error}");
         }
     }
     // The command can finish between the client sending a signal and its
     // arrival. Execution IDs keep that race from signaling a reused PID.
+    StatusCode::NO_CONTENT
+}
+
+pub(super) async fn resize_handler(
+    State(state): State<PodServerState>,
+    Query(request): Query<ResizeRequest>,
+) -> StatusCode {
+    let sender = state.executions.lock().unwrap().get(&request.id).cloned();
+    if let Some(sender) = sender {
+        if let Err(error) = sender
+            .send(Control::Resize(TerminalSize {
+                rows: request.rows,
+                cols: request.cols,
+            }))
+            .await
+        {
+            log::debug!("exec finished before resize delivery: {error}");
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -100,11 +126,21 @@ pub(super) async fn exec_handler(
         .current_dir(repo_path.join(&spec.relative_workdir))
         .env_clear()
         .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    command.as_std_mut().process_group(0);
+    let terminal = match &spec.terminal {
+        Some(terminal) => Some(
+            Pty::prepare(&mut command, terminal)
+                .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?,
+        ),
+        None => {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command.as_std_mut().process_group(0);
+            None
+        }
+    };
     let mut executions = state.executions.lock().unwrap();
     if executions.contains_key(&spec.id) {
         return Err((
@@ -118,8 +154,11 @@ pub(super) async fn exec_handler(
             format!("starting exec program: {error}"),
         )
     })?;
-    let (signal_tx, signals) = mpsc::channel(4);
-    executions.insert(spec.id, signal_tx);
+    // Command retains the configured slave descriptors after spawn.
+    // Release them so PTY EOF follows the last child closing its terminal.
+    drop(command);
+    let (control_tx, controls) = mpsc::channel(4);
+    executions.insert(spec.id, control_tx);
     drop(executions);
     let registration = RegisteredExecution {
         executions: state.executions,
@@ -127,7 +166,8 @@ pub(super) async fn exec_handler(
     };
     let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
     tokio::spawn(async move {
-        if let Err(error) = run_process(child, reader, &tx, signals, registration).await {
+        if let Err(error) = run_process(child, reader, &tx, controls, registration, terminal).await
+        {
             if let Err(send_error) = tx
                 .send(Ok(Frame::Error(format!("{error:#}")).encode()))
                 .await
@@ -146,25 +186,36 @@ async fn run_process(
     mut child: Child,
     reader: impl AsyncRead + Unpin,
     tx: &mpsc::Sender<io::Result<Vec<u8>>>,
-    mut signals: mpsc::Receiver<Signal>,
+    mut controls: mpsc::Receiver<Control>,
     registration: RegisteredExecution,
+    terminal: Option<Pty>,
 ) -> Result<()> {
     let mut group = ProcessGroup::new(&child);
     let pid = Pid::from_raw(child.id().context("exec process has no PID")? as i32);
-    let stdin = child.stdin.take().context("exec stdin missing")?;
-    let stdout = child.stdout.take().context("exec stdout missing")?;
-    let stderr = child.stderr.take().context("exec stderr missing")?;
+    let mut session = if terminal.is_some() {
+        Some(TerminalSession::new(pid)?)
+    } else {
+        None
+    };
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let completed = async {
-        tokio::try_join!(
-            forward_output(stdout, tx, Frame::Stdout),
-            forward_output(stderr, tx, Frame::Stderr),
-        )?;
+        match &terminal {
+            Some(terminal) => forward_terminal_output(terminal, tx).await?,
+            None => {
+                tokio::try_join!(
+                    forward_output(stdout.context("exec stdout missing")?, tx, Frame::Stdout),
+                    forward_output(stderr.context("exec stderr missing")?, tx, Frame::Stderr),
+                )?;
+            }
+        }
         // Keep the leader unreaped while descendants hold output open. Its
         // reserved PID lets signals safely reach the process group even after
         // the leader exits, without risking a newly reused PID.
         child.wait().await.context("waiting for exec process")
     };
-    let input = forward_input(reader, stdin);
+    let input = forward_input(reader, stdin, terminal.as_ref());
     tokio::pin!(completed, input);
     let status = loop {
         tokio::select! {
@@ -172,14 +223,34 @@ async fn run_process(
             result = &mut input => {
                 return result.context("exec input failed; command outcome is unknown");
             }
-            Some(signal) = signals.recv() => {
-                forward_signal(pid, signal)?;
+            Some(control) = controls.recv() => {
+                match control {
+                    Control::Signal(signal) => {
+                        if let Some(terminal) = &terminal {
+                            if let Some(foreground) = terminal.foreground_group()? {
+                                if foreground != pid {
+                                    forward_signal(foreground, signal)?;
+                                }
+                            }
+                        }
+                        forward_signal(pid, signal)?;
+                    }
+                    Control::Resize(size) => {
+                        terminal
+                            .as_ref()
+                            .context("terminal resize for exec without a terminal")?
+                            .resize(size)?;
+                    }
+                }
             }
             _ = tx.closed() => {
                 return Err(anyhow::anyhow!("exec client disconnected; terminating command"));
             }
         }
     };
+    if let Some(session) = &mut session {
+        session.completed();
+    }
     drop(registration);
     let code = match (status.code(), status.signal()) {
         (Some(code), None) => u8::try_from(code).context("invalid exec exit code")?,
@@ -195,8 +266,20 @@ async fn run_process(
     Ok(())
 }
 
-async fn forward_input(mut reader: impl AsyncRead + Unpin, stdin: ChildStdin) -> Result<()> {
-    let mut stdin = Some(stdin);
+enum Input<'a> {
+    Pipe(ChildStdin),
+    Terminal(&'a Pty),
+}
+
+async fn forward_input(
+    mut reader: impl AsyncRead + Unpin,
+    stdin: Option<ChildStdin>,
+    terminal: Option<&Pty>,
+) -> Result<()> {
+    let mut stdin = Some(match terminal {
+        Some(terminal) => Input::Terminal(terminal),
+        None => Input::Pipe(stdin.context("exec stdin missing")?),
+    });
     let mut eof = false;
     loop {
         match exec_stream::read_frame(&mut reader).await? {
@@ -205,10 +288,19 @@ async fn forward_input(mut reader: impl AsyncRead + Unpin, stdin: ChildStdin) ->
                     return Err(anyhow::anyhow!("exec stdin data after EOF"));
                 }
                 if let Some(writer) = &mut stdin {
-                    match writer.write_all(&data).await {
+                    let result = match writer {
+                        Input::Pipe(writer) => writer.write_all(&data).await,
+                        Input::Terminal(terminal) => terminal.write_all(&data).await,
+                    };
+                    match result {
                         Ok(()) => {}
                         // A command may finish reading before the producer finishes.
                         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => stdin = None,
+                        Err(error)
+                            if terminal.is_some() && error.raw_os_error() == Some(libc::EIO) =>
+                        {
+                            stdin = None;
+                        }
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -218,6 +310,8 @@ async fn forward_input(mut reader: impl AsyncRead + Unpin, stdin: ChildStdin) ->
                     return Err(anyhow::anyhow!("duplicate exec stdin EOF"));
                 }
                 eof = true;
+                // A PTY cannot be half-closed. Leave it alive for output;
+                // terminal EOF is the caller's Ctrl-D byte, not transport EOF.
                 stdin = None;
             }
             Some(Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) | Frame::Error(_)) => {
@@ -232,6 +326,22 @@ async fn forward_input(mut reader: impl AsyncRead + Unpin, stdin: ChildStdin) ->
                 return std::future::pending().await;
             }
         }
+    }
+}
+
+async fn forward_terminal_output(
+    terminal: &Pty,
+    tx: &mpsc::Sender<io::Result<Vec<u8>>>,
+) -> Result<()> {
+    let mut buffer = vec![0; CHUNK_SIZE];
+    loop {
+        let count = terminal.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        tx.send(Ok(Frame::Stdout(buffer[..count].to_vec()).encode()))
+            .await
+            .context("streaming exec terminal output")?;
     }
 }
 

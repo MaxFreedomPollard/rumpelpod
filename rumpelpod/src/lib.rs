@@ -17,6 +17,7 @@ mod cp;
 mod devcontainer;
 mod exec;
 mod exec_proxy;
+mod exec_pty;
 mod exec_stream;
 mod executor;
 mod streaming_upload;

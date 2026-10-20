@@ -155,12 +155,14 @@ pub enum Command {
     ///
     /// Uses the pod user and resolved environment. The working directory
     /// corresponds to your current directory relative to the repository root.
-    /// Streams stdin, stdout, and stderr without allocating a terminal.
+    /// Streams stdin, stdout, and stderr. Use --tty for terminal programs
+    /// such as SSH password prompts; terminal output combines stdout and stderr.
     /// Commands are never retried after a connection failure.
     ///
     /// Examples:
     ///   rumpel exec dev -- cargo test
     ///   rumpel exec dev -- sh -c 'echo hello && pwd'
+    ///   rumpel exec -t dev -- ssh example.com
     #[command(verbatim_doc_comment)]
     Exec(ExecCommand),
 
@@ -482,6 +484,13 @@ pub struct EnterCommand {
 
 #[derive(Args)]
 pub struct ExecCommand {
+    /// Allocate a pseudo-terminal (stdin is already forwarded without this flag)
+    ///
+    /// Combines stdout and stderr. Use Ctrl-D for terminal EOF; closing piped
+    /// stdin does not close the terminal.
+    #[arg(short = 't', long)]
+    pub tty: bool,
+
     /// Name of an existing connected pod
     #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
     pub name: String,
