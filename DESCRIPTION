@@ -1,0 +1,9 @@
+Give intermittent CI tests more chances
+
+Allow three retries per failed test in the Linux CI pipeline, while
+retaining xtest's ten-retry suite budget to limit the cost of widespread
+failures. Keep the local default at one retry for faster feedback.
+
+The v0.13.0 commit passed its tag pipeline but failed the main pipeline,
+which suggests an intermittent failure. Retrying individual tests avoids
+paying for another full build when a transient failure can recover.
