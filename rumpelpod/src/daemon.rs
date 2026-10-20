@@ -553,10 +553,12 @@ struct PodLifecycleState {
     deleting: usize,
     next_task: u64,
     tasks: HashMap<u64, StartupTask>,
+    owner: Option<u64>,
     host: String,
 }
 
 struct StartupTask {
+    operation: crate::control::Operation,
     abort: tokio::task::AbortHandle,
     done: tokio::sync::watch::Receiver<bool>,
 }
@@ -571,7 +573,16 @@ struct StartupCompletion {
 
 impl Drop for StartupCompletion {
     fn drop(&mut self) {
-        self.lock.state.lock().unwrap().tasks.remove(&self.id);
+        let mut state = self.lock.state.lock().unwrap();
+        if let Some(task) = state.tasks.remove(&self.id) {
+            log::debug!(
+                "pod lifecycle operation finished or cancelled: {}",
+                task.operation.describe()
+            );
+        }
+        if state.owner == Some(self.id) {
+            state.owner = None;
+        }
         self.done.send_replace(true);
     }
 }
@@ -616,6 +627,15 @@ struct PodLifecycleGuard {
 }
 
 impl PodLifecycleLock {
+    fn describe_owner(&self) -> String {
+        let state = self.state.lock().unwrap();
+        state
+            .owner
+            .and_then(|id| state.tasks.get(&id))
+            .map(|task| task.operation.describe())
+            .unwrap_or_else(|| "another lifecycle operation".to_string())
+    }
+
     fn queue(self: &Arc<Self>) -> Result<PodLifecycleRequest> {
         let state = self.state.lock().unwrap();
         if state.deleting != 0 {
@@ -630,6 +650,8 @@ impl PodLifecycleLock {
     fn spawn<T: Send + 'static>(
         self: &Arc<Self>,
         host: String,
+        name: &'static str,
+        pod_name: String,
         progress: Option<std::sync::mpsc::Sender<OutputLine>>,
         future: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<tokio::task::JoinHandle<Result<T>>> {
@@ -647,31 +669,43 @@ impl PodLifecycleLock {
             done: done_tx,
         };
         let lease = self.lease.clone();
+        let lock = self.clone();
+        let operation = crate::control::Operation::new(format!("{name} pod '{pod_name}'"));
+        let task_operation = operation.clone();
         let handle = crate::async_runtime::RUNTIME.spawn(async move {
             let _completion = completion;
             let _lease = match lease.clone().try_lock_owned() {
                 Ok(lease) => lease,
                 Err(_) => {
+                    let owner = lock.describe_owner();
+                    let message = format!("waiting for another operation on this pod... ({owner})");
+                    log::info!("{message}");
                     if let Some(progress) = progress {
-                        if progress
-                            .send(OutputLine::Stderr(
-                                "waiting for another operation on this pod...".into(),
-                            ))
-                            .is_err()
-                        {
+                        if progress.send(OutputLine::Stderr(message)).is_err() {
                             log::debug!(
                                 "startup client disconnected while waiting for the lifecycle lock"
                             );
                         }
                     }
-                    lease.lock_owned().await
+                    crate::control::bounded("waiting for pod lifecycle lock", async {
+                        Ok(lease.lock_owned().await)
+                    }).await.with_context(|| format!("pod is busy ({}); the existing operation is still running; retry later", lock.describe_owner()))?
                 }
             };
-            future.await
+            lock.state.lock().unwrap().owner = Some(id);
+            let result = task_operation.scope(future).await;
+            if result.is_err() {
+                log::warn!(
+                    "pod lifecycle operation failed: {}",
+                    task_operation.describe()
+                );
+            }
+            result
         });
         state.tasks.insert(
             id,
             StartupTask {
+                operation,
                 abort: handle.abort_handle(),
                 done: done_rx,
             },
@@ -691,6 +725,10 @@ impl PodLifecycleLock {
                 .collect::<Vec<_>>()
         };
         for task in &tasks {
+            log::info!(
+                "cancelling pod lifecycle operation for deletion: {}",
+                task.operation.describe()
+            );
             task.abort.abort();
         }
         let lease = block_on(async {
@@ -718,7 +756,10 @@ impl PodLifecycleRequest {
             Ok(lease) => lease,
             Err(_) => {
                 on_wait();
-                block_on(self.lifecycle_lock.lease.clone().lock_owned())
+                block_on(crate::control::bounded(
+                    "waiting for pod lifecycle lock",
+                    async { Ok(self.lifecycle_lock.lease.clone().lock_owned().await) },
+                ))?
             }
         };
         let state = self.lifecycle_lock.state.lock().unwrap();
@@ -2421,8 +2462,9 @@ async fn read_container_server_port_async(
         echo "timeout waiting for /opt/rumpelpod/server-port" >&2
         exit 1
     "#};
-    let out = executor
-        .exec_async(
+    let out = crate::control::bounded(
+        "server port query",
+        executor.exec_async(
             container,
             crate::executor::ExecRequest {
                 cmd: vec!["sh".into(), "-c".into(), script.into()],
@@ -2430,9 +2472,10 @@ async fn read_container_server_port_async(
                 env: Vec::new(),
                 stdin: None,
             },
-        )
-        .await
-        .context("waiting for server-port file in container")?;
+        ),
+    )
+    .await
+    .context("waiting for server-port file in container")?;
     if out.exit_code != 0 {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow::anyhow!(
@@ -2636,7 +2679,10 @@ impl DaemonServer {
         executor: &crate::executor::Executor,
         backend_container: &str,
     ) -> Result<()> {
-        let _setup = pod_connection.git_tunnel_setup_guard_async().await;
+        let _setup = crate::control::bounded("waiting for git tunnel setup", async {
+            Ok(pod_connection.git_tunnel_setup_guard_async().await)
+        })
+        .await?;
         if pod_connection.git_tunnel_is_alive()
             && pod_connection.git_tunnel_targets_container(backend_container)
         {
@@ -2812,7 +2858,7 @@ impl DaemonServer {
                 .context("reading server-port file for existing pod")?;
             let proxy = match agent_container {
                 Some(container) => {
-                    (crate::exec_proxy::start_exec_proxy_in_container(
+                    (crate::exec_proxy::start_pod_http_proxy_in_container(
                         executor.clone(),
                         container.to_string(),
                         serve_port,
@@ -2820,7 +2866,7 @@ impl DaemonServer {
                     .await
                 }
                 None => {
-                    (crate::exec_proxy::start_exec_proxy(
+                    (crate::exec_proxy::start_pod_http_proxy(
                         executor.clone(),
                         pod_id.clone(),
                         serve_port,
@@ -3772,7 +3818,7 @@ impl DaemonServer {
         let serve_port = read_container_server_port_async(&executor, exec_pod_id.as_str())
             .await
             .map_err(|e| mark_error(e.context("reading server-port file from new k8s pod")))?;
-        let proxy = (crate::exec_proxy::start_exec_proxy(
+        let proxy = (crate::exec_proxy::start_pod_http_proxy(
             executor.clone(),
             exec_pod_id.clone(),
             serve_port,
@@ -3999,15 +4045,18 @@ impl DaemonServer {
         match initialize_mode {
             InitializeMode::IfCreating => {
                 let docker_socket = initialize_docker_socket(&docker_host);
-                crate::initialize::run_async(
-                    &repo_path,
-                    devcontainer_path.as_deref(),
-                    &pod_name.0,
-                    &docker_host,
-                    docker_socket.as_deref(),
-                    ssh_auth_sock.as_deref(),
-                    &mut local_env_vars,
-                    &build_tx,
+                crate::control::phase(
+                    "host initializer",
+                    crate::initialize::run_async(
+                        &repo_path,
+                        devcontainer_path.as_deref(),
+                        &pod_name.0,
+                        &docker_host,
+                        docker_socket.as_deref(),
+                        ssh_auth_sock.as_deref(),
+                        &mut local_env_vars,
+                        &build_tx,
+                    ),
                 )
                 .await?;
             }
@@ -4737,7 +4786,7 @@ impl DaemonServer {
             let serve_port = read_container_server_port_async(&executor, backend_container)
                 .await
                 .context("reading server-port file for new container")?;
-            let proxy = (crate::exec_proxy::start_exec_proxy_in_container(
+            let proxy = (crate::exec_proxy::start_pod_http_proxy_in_container(
                 executor.clone(),
                 backend_container.to_string(),
                 serve_port,
@@ -5348,7 +5397,7 @@ impl DaemonServer {
                 if let Ok(serve_port) =
                     read_container_server_port_async(&executor, agent_container).await
                 {
-                    if let Ok(proxy) = (crate::exec_proxy::start_exec_proxy_in_container(
+                    if let Ok(proxy) = (crate::exec_proxy::start_pod_http_proxy_in_container(
                         executor.clone(),
                         agent_container.to_string(),
                         serve_port,
@@ -5537,7 +5586,7 @@ impl DaemonServer {
         self.ensure_git_tunnel(&pod_connection, &executor, &agent_container)
             .context("starting docker tunnel")?;
 
-        let proxy = block_on(crate::exec_proxy::start_exec_proxy_in_container(
+        let proxy = block_on(crate::exec_proxy::start_pod_http_proxy_in_container(
             executor.clone(),
             agent_container.clone(),
             serve_port,
@@ -5899,14 +5948,21 @@ impl Daemon for DaemonServer {
         let lock = self
             .lifecycle_locks
             .for_pod(&params.repo_path, &params.pod_name.0);
-        let handle = lock.spawn(params.host.to_string(), Some(tx.clone()), async move {
-            let mut resources = this.startup_resources(&params.repo_path, &params.pod_name.0)?;
-            let result = this
-                .launch_pod_impl(params, tx, InitializeMode::IfCreating)
-                .await;
-            resources.retain |= result.is_ok();
-            result
-        })?;
+        let handle = lock.spawn(
+            params.host.to_string(),
+            "enter",
+            params.pod_name.0.clone(),
+            Some(tx.clone()),
+            async move {
+                let mut resources =
+                    this.startup_resources(&params.repo_path, &params.pod_name.0)?;
+                let result = this
+                    .launch_pod_impl(params, tx, InitializeMode::IfCreating)
+                    .await;
+                resources.retain |= result.is_ok();
+                result
+            },
+        )?;
         Ok(ServerLaunchProgress {
             rx: Some(rx),
             handle: Some(handle),
@@ -5920,12 +5976,19 @@ impl Daemon for DaemonServer {
         let lock = self
             .lifecycle_locks
             .for_pod(&params.repo_path, &params.pod_name.0);
-        let handle = lock.spawn(params.host.to_string(), Some(tx.clone()), async move {
-            let mut resources = this.startup_resources(&params.repo_path, &params.pod_name.0)?;
-            let result = this.recreate_pod_impl(params, tx).await;
-            resources.retain |= result.is_ok();
-            result
-        })?;
+        let handle = lock.spawn(
+            params.host.to_string(),
+            "recreate",
+            params.pod_name.0.clone(),
+            Some(tx.clone()),
+            async move {
+                let mut resources =
+                    this.startup_resources(&params.repo_path, &params.pod_name.0)?;
+                let result = this.recreate_pod_impl(params, tx).await;
+                resources.retain |= result.is_ok();
+                result
+            },
+        )?;
         Ok(ServerLaunchProgress {
             rx: Some(rx),
             handle: Some(handle),
@@ -5945,12 +6008,19 @@ impl Daemon for DaemonServer {
                 .context("source pod not found")?;
             serde_json::from_str::<Host>(&source.host)?.to_string()
         };
-        let handle = lock.spawn(host, Some(tx.clone()), async move {
-            let mut resources = this.startup_resources(&request.repo_path, &request.new_name)?;
-            let result = this.fork_pod_impl(request, tx).await;
-            resources.retain |= result.is_ok();
-            result
-        })?;
+        let handle = lock.spawn(
+            host,
+            "fork",
+            request.new_name.clone(),
+            Some(tx.clone()),
+            async move {
+                let mut resources =
+                    this.startup_resources(&request.repo_path, &request.new_name)?;
+                let result = this.fork_pod_impl(request, tx).await;
+                resources.retain |= result.is_ok();
+                result
+            },
+        )?;
         Ok(ServerLaunchProgress {
             rx: Some(rx),
             handle: Some(handle),
@@ -6537,9 +6607,13 @@ impl Daemon for DaemonServer {
             .lifecycle_locks
             .for_pod(&request.repo_path, &request.pod_name);
         let this = self.handle();
-        let handle = lock.spawn(host, None, async move {
-            this.connect_pod_impl_async(request).await
-        })?;
+        let handle = lock.spawn(
+            host,
+            "connect",
+            request.pod_name.clone(),
+            None,
+            async move { this.connect_pod_impl_async(request).await },
+        )?;
         block_on(handle).map_err(startup_join_error)?
     }
 

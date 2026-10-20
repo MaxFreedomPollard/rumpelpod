@@ -17,3 +17,6 @@ that second command execution implementation.
 
 Keep receive capacity available across concurrent HTTP/2 streams so
 stalled command input or output cannot starve unrelated executions.
+
+Retain cancellable transport recovery from main while keeping event idle
+limits scoped to the event stream, not long-running executions.

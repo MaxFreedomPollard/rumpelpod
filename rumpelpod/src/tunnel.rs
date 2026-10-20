@@ -32,7 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::executor::{ExecRequest, ExecStreams, Executor};
+use crate::executor::{ExecStreams, Executor};
 use crate::jitter;
 
 const FRAME_OPEN: u8 = 0x01;
@@ -112,24 +112,24 @@ pub fn run_tunnel_server() -> ! {
 }
 
 async fn run_tunnel_server_async() {
+    let (progress, progress_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        wait_for_stalled_host(progress_rx, std::time::Duration::from_secs(60)).await;
+        eprintln!("tunnel-server: no host input progress; releasing tunnel port");
+        std::process::exit(0);
+    });
     let path = std::path::Path::new(crate::port_file::TUNNEL_PORT_FILE);
 
-    // Reuse the previously recorded port if the file is still around
-    // (e.g. after a tunnel-server restart that kept the container
-    // alive).  If the port is held by something else we fail hard --
-    // there is no point retrying because nothing else in the container
-    // is allowed to squat on a port we are meant to own.
+    // Reuse the recorded port so existing gateway URLs survive recovery.
+    // An older transport can still own it until its progress lease expires;
+    // binding must fail until that owner has actually exited.
     let preferred = match crate::port_file::read_preferred(path) {
         Ok(p) => p,
         Err(e) => panic!("reading tunnel port file: {e:#}"),
     };
 
-    // Clear the stale file before binding so observers block until we
-    // have written the authoritative value.
-    if let Err(e) = crate::port_file::remove_if_present(path) {
-        panic!("removing stale tunnel port file: {e:#}");
-    }
-
+    // A previous transport may still own this port. Leave its discovery
+    // file intact until its lease expires and we successfully bind.
     let addr = match preferred {
         Some(p) => format!("127.0.0.1:{p}"),
         None => "127.0.0.1:0".to_string(),
@@ -167,12 +167,13 @@ async fn run_tunnel_server_async() {
         let mut stdin = tokio::io::stdin();
         loop {
             let frame = match read_frame(&mut stdin).await {
-                Ok(f) => f,
-                Err(_) => {
-                    eprintln!("tunnel-server: exec session closed, exiting");
+                Ok(frame) => frame,
+                Err(error) => {
+                    eprintln!("tunnel-server: exec session closed: {error:#}");
                     std::process::exit(0);
                 }
             };
+            progress.send_replace(());
             match frame.frame_type {
                 FRAME_DATA => {
                     let map = streams_for_stdin.lock().await;
@@ -276,6 +277,16 @@ async fn run_tunnel_server_async() {
             let _ = writer.shutdown().await;
         });
     }
+}
+
+// The watchdog is independent of startup and frame dispatch. A dead SSH
+// transport or a wedged stream consumer must not retain the listener forever.
+// Host heartbeats renew the lease even when a healthy tunnel carries no data.
+async fn wait_for_stalled_host(
+    mut progress: tokio::sync::watch::Receiver<()>,
+    idle_timeout: std::time::Duration,
+) {
+    while let Ok(Ok(())) = tokio::time::timeout(idle_timeout, progress.changed()).await {}
 }
 
 async fn notify_container_server_gateway_port(tunnel_port: u16) -> Result<()> {
@@ -507,28 +518,33 @@ fn spawn_host_mux(
                             }
                         }
                     }
-                    _ = keepalive_interval.tick() => {
-                        let mut w = stdin_mu.lock().await;
-                        if write_frame(
-                            &mut *w,
-                            &Frame {
-                                stream_id: 0,
-                                frame_type: FRAME_DATA,
-                                payload: Vec::new(),
-                            },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
+
                 }
             }
         };
-        // Cancellation must also interrupt awaits within a frame handler.
+        // Heartbeats and cancellation must run even while one forwarded
+        // stream is waiting on a slow local service.
+        let heartbeat = async {
+            loop {
+                keepalive_interval.tick().await;
+                let mut writer = pod_stdin_mu.lock().await;
+                if let Err(error) = write_frame(
+                    &mut *writer,
+                    &Frame {
+                        stream_id: 0,
+                        frame_type: FRAME_DATA,
+                        payload: Vec::new(),
+                    },
+                )
+                .await
+                {
+                    break error;
+                }
+            }
+        };
         tokio::select! {
             () = mux => {}
+            error = heartbeat => log::debug!("tunnel heartbeat failed: {error:#}"),
             _ = cancel_rx.changed() => {}
         }
         alive.store(false, Ordering::Relaxed);
@@ -541,12 +557,14 @@ fn spawn_host_mux(
 /// waits for the readiness line on stderr, and spawns a mux task that
 /// bridges frames to local TCP connections to `target_addr`.
 ///
-/// Retries on failure indefinitely (the caller can cancel).
+/// Retries transient failures within the control deadline. The returned
+/// tunnel has no overall lifetime limit.
 pub async fn start_tunnel(
     executor: &Executor,
     container: &str,
     target_addr: &str,
 ) -> Result<TunnelHandle> {
+    crate::control::bounded("git tunnel setup", async {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -560,6 +578,7 @@ pub async fn start_tunnel(
             }
         }
     }
+    }).await
 }
 
 /// Attempt to start a tunnel once.
@@ -571,7 +590,11 @@ pub(crate) async fn try_start_tunnel(
     container: &str,
     target_addr: &str,
 ) -> Result<TunnelHandle> {
-    start_tunnel_inner(executor, container, target_addr).await
+    crate::control::bounded(
+        "git tunnel setup",
+        start_tunnel_inner(executor, container, target_addr),
+    )
+    .await
 }
 
 async fn start_tunnel_inner(
@@ -579,25 +602,6 @@ async fn start_tunnel_inner(
     container: &str,
     target_addr: &str,
 ) -> Result<TunnelHandle> {
-    // Kill any leftover tunnel-server from a previous run.  We don't
-    // care whether the pkill finds anything, just that we don't race
-    // a stale process for the loopback port inside the pod.
-    let _ = executor
-        .exec_async(
-            container,
-            ExecRequest {
-                cmd: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "pkill -f 'rumpel tunnel-server' 2>/dev/null; sleep 0.5; true".into(),
-                ],
-                workdir: None,
-                env: Vec::new(),
-                stdin: None,
-            },
-        )
-        .await;
-
     let ExecStreams {
         stdin,
         stdout,
@@ -692,6 +696,49 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn tunnel_lease_expires_even_when_dispatch_is_blocked() {
+        let (progress, progress_rx) = tokio::sync::watch::channel(());
+        let (sender, _blocked_consumer) = mpsc::channel(1);
+        sender.send(vec![0]).await.unwrap();
+        let dispatch = tokio::spawn(async move {
+            progress.send_replace(());
+            // Simulate a full per-stream queue. Its blocked send must not
+            // prevent the independent watchdog from expiring the listener.
+            sender.send(vec![1]).await.unwrap();
+            drop(progress);
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_stalled_host(progress_rx, Duration::from_millis(100)),
+        )
+        .await
+        .expect("blocked dispatch suppressed the tunnel lease");
+        assert!(!dispatch.is_finished());
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tunnel_lease_is_renewed_by_ongoing_progress() {
+        let (progress, progress_rx) = tokio::sync::watch::channel(());
+        let watchdog = tokio::spawn(wait_for_stalled_host(
+            progress_rx,
+            Duration::from_millis(500),
+        ));
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            progress.send_replace(());
+            assert!(!watchdog.is_finished(), "healthy tunnel lease expired");
+        }
+        // Keep the sender open: absence of progress, not EOF, must expire it.
+        tokio::time::timeout(Duration::from_secs(2), watchdog)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(progress);
+    }
 
     /// FRAME_CLOSE from the pod must half-close the host's outbound TCP
     /// so the server observes EOF and releases the fd.  Without

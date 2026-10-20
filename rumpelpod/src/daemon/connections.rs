@@ -8,7 +8,6 @@
 //! host *and* a pod lives here, including the pod event loop and the
 //! host-event / git-tunnel tasks.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use log::{debug, info};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::broadcast;
 
 use crate::async_runtime::RUNTIME;
@@ -291,8 +291,15 @@ fn run_pod_event_loop(
         pod.set_status(PodConnectionStatus::Connecting);
         pod.emit_reconnect(ReconnectEvent::HostConnected);
 
-        let mut reader = match connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token)
-        {
+        let connection_epoch = pod.pod_repair_epoch();
+        let Some(connected) = crate::async_runtime::block_on(pod.event_request(
+            &stop,
+            connection_epoch,
+            connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token),
+        )) else {
+            continue;
+        };
+        let mut reader = match connected {
             Ok((reader, greeting)) => {
                 pod.apply_greeting(greeting);
                 pod.set_status(PodConnectionStatus::Connected);
@@ -339,7 +346,14 @@ fn run_pod_event_loop(
                 break;
             }
             let mut line = String::new();
-            match reader.read_line(&mut line) {
+            let Some(read) = crate::async_runtime::block_on(pod.event_request(
+                &stop,
+                connection_epoch,
+                reader.read_line(&mut line),
+            )) else {
+                break;
+            };
+            match read {
                 Ok(0) => {
                     info!("pod event stream for '{pod_name}' closed; reconnecting");
                     break;
