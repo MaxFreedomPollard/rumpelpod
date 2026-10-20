@@ -33,3 +33,9 @@ The upstream behavior was confirmed in rust-v0.163.0 at
 46d252f8bf8b09f4ef765bc72e40f02c229da3e6. Codex exposes no supported
 frontend retry-exhaustion notification, so the terminal banner is a
 version-sensitive compatibility boundary covered by the tests.
+
+Validation: cargo pipeline plus --continue completed with 666 passed and
+3 skipped. The large-catalog case exceeded its startup deadline during
+the full run and passed in 15 seconds when rerun alone. The SSH cases
+passed in isolation and in the full run. macOS validation was not
+available because the configured macos SSH hostname did not resolve.

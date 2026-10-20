@@ -620,15 +620,15 @@ async fn proxy_connection(
                         let msg = msg.context("reading WebSocket from pod /codex")?;
                         if let tungstenite::Message::Text(text) = &msg {
                             if !thread_requests.is_empty() {
-                            let response: Value = serde_json::from_str(text)?;
-                            if let Some(id) = response.get("id").filter(|_| response.get("result").is_some() || response.get("error").is_some()) {
-                                if thread_requests.remove(&id.to_string()) && response.get("error").is_none() {
-                                    let id = response["result"]["thread"]["id"]
-                                        .as_str()
-                                        .context("Codex thread response is missing its ID")?;
-                                    *thread.lock().unwrap() = Some(id.to_string());
+                                let response: Value = serde_json::from_str(text)?;
+                                if let Some(id) = response.get("id").filter(|_| response.get("result").is_some() || response.get("error").is_some()) {
+                                    if thread_requests.remove(&id.to_string()) && response.get("error").is_none() {
+                                        let id = response["result"]["thread"]["id"]
+                                            .as_str()
+                                            .context("Codex thread response is missing its ID")?;
+                                        *thread.lock().unwrap() = Some(id.to_string());
+                                    }
                                 }
-                            }
                             }
                         }
                         client_write.send(msg).await.context("forwarding WebSocket to codex TUI")?;
