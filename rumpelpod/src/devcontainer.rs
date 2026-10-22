@@ -1070,10 +1070,12 @@ pub struct SubstitutionContext {
 pub fn substitute_vars(value: &str, ctx: &SubstitutionContext) -> String {
     let mut result = value.to_string();
     let mut i = 0;
-    // Jump from one `${` to the next: advancing one byte at a time would
-    // land inside multi-byte UTF-8 characters, where slicing panics.
-    while let Some(offset) = result[i..].find("${") {
-        let start = i + offset;
+    while i < result.len() {
+        if !result[i..].starts_with("${") {
+            i += 1;
+            continue;
+        }
+        let start = i;
         let after_dollar_brace = start + 2;
         let Some(close) = result[after_dollar_brace..].find('}') else {
             break;
