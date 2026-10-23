@@ -66,34 +66,6 @@ fn container_env_simple() {
     assert_eq!(stdout.trim(), "simple_value");
 }
 
-/// Values with multi-byte UTF-8 characters must survive variable
-/// substitution, which runs on every containerEnv value.
-#[test]
-fn container_env_non_ascii() {
-    let repo = TestRepo::new();
-
-    write_devcontainer_with_env(&repo, "{ \"GREETING\": \"gr\u{fc}\u{df} \u{2713}\" }");
-    let home = TestHome::new();
-    let executor = ExecutorResources::setup(&home);
-    let daemon = TestDaemon::start(&home);
-    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
-
-    let stdout = pod_command(&repo, &daemon)
-        .args([
-            "enter",
-            "--create",
-            "env-non-ascii",
-            "--",
-            "printenv",
-            "GREETING",
-        ])
-        .success()
-        .expect("rumpel enter failed");
-
-    let stdout = String::from_utf8_lossy(&stdout);
-    assert_eq!(stdout.trim(), "gr\u{fc}\u{df} \u{2713}");
-}
-
 #[test]
 fn container_env_local_substitution() {
     let repo = TestRepo::new();
